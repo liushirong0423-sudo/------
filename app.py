@@ -144,11 +144,18 @@ YFINANCE_FX = {
     "美元/人民币":"CNY=X",
 }
 YFINANCE_COMMODITY = {
-    "黄金":   "GC=F",
-    "原油WTI": "CL=F",
-    "铜":     "HG=F",
-    "白银":   "SI=F",
-    "天然气": "NG=F",
+    "黄金":     "GC=F",
+    "原油WTI":  "CL=F",
+    "布伦特原油": "BZ=F",
+    "铜":       "HG=F",
+    "白银":     "SI=F",
+    "天然气":   "NG=F",
+    "小麦":     "ZW=F",
+    "玉米":     "ZC=F",
+}
+YFINANCE_VOLATILITY = {
+    "VVIX":    "^VVIX",   # Volatility of VIX — 市场对市场的波动性
+    "SKEW指数": "^SKEW",  # CBOE Skew — 尾部风险溢价
 }
 YFINANCE_CRYPTO = {
     "比特币": "BTC-USD",
@@ -156,7 +163,7 @@ YFINANCE_CRYPTO = {
 
 ALL_YFINANCE = {
     **YFINANCE_EQUITY, **YFINANCE_RATES, **YFINANCE_RISK,
-    **YFINANCE_FX, **YFINANCE_COMMODITY, **YFINANCE_CRYPTO,
+    **YFINANCE_FX, **YFINANCE_COMMODITY, **YFINANCE_VOLATILITY, **YFINANCE_CRYPTO,
 }
 
 # FRED序列配置：{显示名: FRED series_id}
@@ -175,6 +182,13 @@ FRED_SERIES = {
     "M2货币供应":      "M2SL",
     "密歇根消费信心":  "UMCSENT",
     "联邦基金利率":    "FEDFUNDS",
+    # ── 高频领先指标 ──
+    "初申请失业金人数": "ICSA",       # 周频，最高频就业先行指标
+    "金融条件指数":    "NFCI",        # 芝加哥联储，周频
+    "金融压力指数":    "STLFSI4",     # 圣路易斯联储，周频
+    "10Y-3M利差":     "T10Y3M",      # 日频，NY Fed衰退概率模型核心变量
+    "工业生产指数":    "INDPRO",      # 月频，经济周期同步指标
+    "建筑许可":        "PERMIT",      # 月频，房地产周期领先6-12月
 }
 
 PERIOD_MAP = {"1Y": 365, "3Y": 1095, "5Y": 1825, "Max": 3650}
@@ -557,6 +571,29 @@ def load_all(days: int):
             data["中美利差(10Y)"]   = _sp.dropna()
             status["中美利差(10Y)"] = "ok"
 
+    # 铜金比率（全球经济健康信号：上升=风险偏好/增长预期强；下降=避险/衰退担忧）
+    _cu = data.get("铜")
+    _au = data.get("黄金")
+    if _cu is not None and _au is not None:
+        _idx_ca = _cu.index.intersection(_au.index)
+        if len(_idx_ca) > 20:
+            _ca = (_cu.loc[_idx_ca] / _au.loc[_idx_ca] * 1000).dropna()
+            _ca.name = "铜金比率"
+            data["铜金比率"]   = _ca
+            status["铜金比率"] = "ok"
+
+    # Sahm规则指标（月频失业率衍生，≥0.5pp自动触发衰退信号）
+    _ur = data.get("美国失业率")
+    if _ur is not None:
+        _ur_clean = _ur.dropna()
+        if len(_ur_clean) >= 14:
+            _u3m   = _ur_clean.rolling(3).mean()
+            _u12mn = _ur_clean.rolling(12).min()
+            _sahm  = (_u3m - _u12mn).dropna()
+            _sahm.name = "Sahm规则指标"
+            data["Sahm规则指标"]   = _sahm
+            status["Sahm规则指标"] = "ok"
+
     if not data:
         return pd.DataFrame(), status
 
@@ -746,6 +783,29 @@ def build_macro_regime(df_: pd.DataFrame, V_: dict, spread_102_) -> dict:
         else:
             signals["中美利差"] = ("🟢", f"中美={cn_us_sp:+.2f}%", "中国利率高于美国：利差支撑人民币和A股外资流入")
 
+    # ── Sahm 规则 ──
+    sahm = safe_val(df_, "Sahm规则指标")
+    if sahm is not None:
+        if sahm >= 0.5:
+            signals["Sahm规则"] = ("🔴", f"Sahm={sahm:.2f}", "已触发衰退：历史准确率接近100%，经济进入或即将进入衰退")
+            watch_list.append(("Sahm规则指标", f"Sahm={sahm:.2f}≥0.5触发线，历史上每次衰退均被捕获"))
+        elif sahm >= 0.3:
+            signals["Sahm规则"] = ("🟡", f"Sahm={sahm:.2f}", "接近触发线：就业市场持续恶化，衰退前期信号增强")
+            watch_list.append(("Sahm规则指标", f"Sahm={sahm:.2f}接近0.5触发线，就业趋势值得警惕"))
+        else:
+            signals["Sahm规则"] = ("🟢", f"Sahm={sahm:.2f}", "未触发：就业市场暂无衰退信号，Sahm < 0.3阈值")
+
+    # ── 金融条件 (NFCI) ──
+    nfci = safe_val(df_, "金融条件指数")
+    if nfci is not None:
+        if nfci > 0.3:
+            signals["金融条件"] = ("🔴", f"NFCI={nfci:.3f}", "金融条件大幅收紧：信贷/股票/影子银行系统均承压")
+            watch_list.append(("金融条件指数NFCI", f"={nfci:.3f}>0.3，金融条件显著偏紧，历史对应市场压力期"))
+        elif nfci > 0:
+            signals["金融条件"] = ("🟡", f"NFCI={nfci:.3f}", "金融条件偏紧：高于历史均值（0），信贷环境有压力")
+        else:
+            signals["金融条件"] = ("🟢", f"NFCI={nfci:.3f}", "金融条件宽松：低于历史均值，有利于信贷扩张")
+
     # ── 宏观情景四象限判断 ──
     growth_ok   = signals.get("就业",      ("🟢",))[0] == "🟢"
     infla_high  = signals.get("通胀",      ("🟢",))[0] in ("🔴", "🟡")
@@ -820,11 +880,12 @@ def build_macro_regime(df_: pd.DataFrame, V_: dict, spread_102_) -> dict:
     anomalies.sort(key=lambda x: abs(x[1]), reverse=True)
     anomalies = anomalies[:8]
 
-    # ── 综合风险评分（满分11分）──
+    # ── 综合风险评分（满分15分）──
     risk_score = 0
     for key, thr_r, thr_y in [
         ("通胀",       2, 1), ("就业",    2, 1), ("收益率曲线", 2, 1),
         ("信用风险",   2, 1), ("波动率",  2, 1), ("流动性",    1, 0),
+        ("Sahm规则",   2, 1), ("金融条件", 1, 0),
     ]:
         icon = signals.get(key, ("🟢",))[0]
         risk_score += thr_r if icon == "🔴" else (thr_y if icon == "🟡" else 0)
@@ -835,10 +896,23 @@ def build_macro_regime(df_: pd.DataFrame, V_: dict, spread_102_) -> dict:
         "regime_desc":   regime_desc,
         "regime_assets": regime_assets,
         "signals":       signals,
-        "watch_list":    watch_list[:8],
+        "watch_list":    watch_list[:10],
         "anomalies":     anomalies,
         "risk_score":    risk_score,
     }
+
+
+def recession_probability(spread_10y_3m) -> float:
+    """
+    基于纽约联储 Probit 模型估算未来 12 个月衰退概率 (0–100%)。
+    参考: Estrella & Mishkin (1998), NY Fed yield curve research。
+    模型：P = Φ(α + β·spread), α=-0.5779, β=-0.8045
+    当 10Y-3M < 0（倒挂）时概率明显升高。
+    """
+    if spread_10y_3m is None:
+        return 0.0
+    z = -0.5779 + (-0.8045) * float(spread_10y_3m)
+    return float((1.0 + np.erf(z / np.sqrt(2.0))) / 2.0 * 100.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -848,7 +922,7 @@ with st.sidebar:
     st.markdown("""
     <div style='padding:8px 0 4px;'>
         <div style='font-size:15px;font-weight:700;color:#f8fafc;'>⚙ 控制面板</div>
-        <div style='font-size:11px;color:#475569;margin-top:2px;'>全维度宏观监控平台 v2.0</div>
+        <div style='font-size:11px;color:#475569;margin-top:2px;'>全维度宏观监控平台 v4.0</div>
     </div>
     """, unsafe_allow_html=True)
     st.divider()
@@ -870,9 +944,12 @@ with st.sidebar:
         ["VIX"] +
         list(YFINANCE_FX.keys()) +
         list(YFINANCE_COMMODITY.keys()) +
+        list(YFINANCE_VOLATILITY.keys()) +
         ["中国10Y国债","沪深300","恒生指数","上证综指","创业板指","中证500","科创50",
          "美联储净流动性","美国CPI同比","美高收益债利差","TIPS_10Y实际利率",
-         "M2货币供应","中美利差(10Y)","联邦基金利率"]
+         "M2货币供应","中美利差(10Y)","联邦基金利率",
+         "铜金比率","Sahm规则指标","10Y-3M利差","金融条件指数","金融压力指数",
+         "初申请失业金人数","工业生产指数","建筑许可"]
     )
     canvas_sel = st.multiselect(
         "叠加指标（多选）", CANVAS_OPTS,
@@ -933,13 +1010,14 @@ st.markdown(f"""
 # ═══════════════════════════════════════════════════════════════════════════
 # 5 个主 Tab
 # ═══════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 风险仪表盘",
     "🌍 全球市场",
     "🔬 万能画布",
     "💰 股债利差 ERP",
     "🔗 深度分析",
     "🧠 综合诊断",
+    "🔮 早期预警雷达",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1088,8 +1166,8 @@ with tab1:
           <div style="font-size:11px;color:#94a3b8;line-height:1.7;">{mc1['regime_desc']}</div>
           <div style="margin-top:12px;padding-top:10px;border-top:1px solid #1e2a3a;">
             <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;">综合风险评分</div>
-            <div style="font-size:22px;font-weight:700;color:{'#ef4444' if mc1['risk_score']>=8 else ('#f59e0b' if mc1['risk_score']>=5 else ('#3b82f6' if mc1['risk_score']>=3 else '#22c55e'))};">
-              {mc1['risk_score']}/11
+            <div style="font-size:22px;font-weight:700;color:{'#ef4444' if mc1['risk_score']>=11 else ('#f59e0b' if mc1['risk_score']>=7 else ('#3b82f6' if mc1['risk_score']>=4 else '#22c55e'))}">
+              {mc1['risk_score']}/15
             </div>
           </div>
         </div>
@@ -1916,12 +1994,12 @@ with tab6:
     st.markdown('<div class="section-title">🎯 宏观情景总判断</div>', unsafe_allow_html=True)
     _reg_col = mc["regime_color"]
     _rs = mc["risk_score"]
-    _rs_color = ("#ef4444" if _rs >= 8 else
-                 "#f59e0b" if _rs >= 5 else
-                 "#3b82f6" if _rs >= 3 else "#22c55e")
-    _rs_label = ("极高风险" if _rs >= 8 else
-                 "高风险"   if _rs >= 5 else
-                 "中等风险" if _rs >= 3 else "低风险")
+    _rs_color = ("#ef4444" if _rs >= 11 else
+                 "#f59e0b" if _rs >= 7 else
+                 "#3b82f6" if _rs >= 4 else "#22c55e")
+    _rs_label = ("极高风险" if _rs >= 11 else
+                 "高风险"   if _rs >= 7 else
+                 "中等风险" if _rs >= 4 else "低风险")
 
     _col_r1, _col_r2, _col_r3 = st.columns([2, 1, 3])
     with _col_r1:
@@ -1939,9 +2017,9 @@ with tab6:
                     padding:24px;text-align:center;height:100%;">
           <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;font-weight:600;">综合风险评分</div>
           <div style="font-size:42px;font-weight:800;color:{_rs_color};margin:8px 0;">{_rs}</div>
-          <div style="font-size:13px;color:{_rs_color};font-weight:600;">/ 11 · {_rs_label}</div>
+          <div style="font-size:13px;color:{_rs_color};font-weight:600;">/ 15 · {_rs_label}</div>
           <div style="font-size:10px;color:#475569;margin-top:8px;line-height:1.5;">
-            通胀/就业/曲线<br>信用/波动率/流动性
+            通胀/就业/Sahm/曲线<br>信用/波动率/流动性/NFCI
           </div>
         </div>
         """, unsafe_allow_html=True)
@@ -2049,7 +2127,7 @@ with tab6:
         <div>
           <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:1px;">综合风险等级</div>
           <div style="font-size:26px;font-weight:700;color:{_rs_color};margin-top:4px;">
-            {_rs}/11 · {_rs_label}
+            {_rs}/15 · {_rs_label}
           </div>
         </div>
         <div style="text-align:right;">
@@ -2079,6 +2157,383 @@ with tab6:
     """, unsafe_allow_html=True)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 7 — 早期预警雷达
+# ══════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.markdown("""
+    <div class="hero-banner" style="margin-bottom:14px;">
+      <div style="font-size:14px;font-weight:700;color:#f8fafc;">🔮 早期预警雷达</div>
+      <div style="font-size:11px;color:#64748b;margin-top:4px;">
+        基于领先指标体系的宏观风险前瞻预判 ·
+        NY Fed衰退概率 · Sahm规则 · 铜金比率 · 金融压力 · 大宗商品信号
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    ew_sub1, ew_sub2, ew_sub3 = st.tabs([
+        "📉 衰退概率仪表", "💹 金融压力监测", "🌿 大宗商品信号"
+    ])
+
+    # ────────────────────────────────────────────────────────────────────
+    # Sub1 — 衰退概率仪表
+    # ────────────────────────────────────────────────────────────────────
+    with ew_sub1:
+        st.markdown('<div class="section-title">📉 衰退前瞻预判体系</div>',
+                    unsafe_allow_html=True)
+
+        _sp10y3m  = safe_val(df, "10Y-3M利差")
+        _rec_prob = recession_probability(_sp10y3m)
+        _sahm_v   = safe_val(df, "Sahm规则指标")
+        _icsa_v   = safe_val(df, "初申请失业金人数")
+        _unrate_v = safe_val(df, "美国失业率")
+
+        # KPI 行
+        ew_k1, ew_k2, ew_k3, ew_k4 = st.columns(4)
+        _rpc = "#ef4444" if _rec_prob > 40 else ("#f59e0b" if _rec_prob > 20 else "#22c55e")
+        ew_k1.markdown(f"""
+        <div class="kpi-card" style="border-color:{_rpc}55;">
+          <div class="kpi-label">衰退概率 (12M)</div>
+          <div class="kpi-value" style="color:{_rpc};">{_rec_prob:.1f}%</div>
+          <div class="kpi-change" style="color:#64748b;">NY Fed 利率曲线模型</div>
+        </div>""", unsafe_allow_html=True)
+
+        ew_k2.markdown(kpi("10Y-3M利差", _sp10y3m, None, "%", fmt="+"),
+                       unsafe_allow_html=True)
+
+        _sahm_c = ("#ef4444" if _sahm_v is not None and _sahm_v >= 0.5 else
+                   "#f59e0b" if _sahm_v is not None and _sahm_v >= 0.3 else "#22c55e")
+        _sahm_lbl = ("🔴 已触发衰退" if _sahm_v is not None and _sahm_v >= 0.5 else
+                     "🟡 预警区间"   if _sahm_v is not None and _sahm_v >= 0.3 else "🟢 安全")
+        ew_k3.markdown(f"""
+        <div class="kpi-card" style="border-color:{_sahm_c}55;">
+          <div class="kpi-label">Sahm 规则指标</div>
+          <div class="kpi-value" style="color:{_sahm_c};">{f'{_sahm_v:.2f}' if _sahm_v is not None else 'N/A'}</div>
+          <div class="kpi-change" style="color:#64748b;">{_sahm_lbl} (触发线 = 0.5)</div>
+        </div>""", unsafe_allow_html=True)
+
+        ew_k4.markdown(kpi("初申请失业金(千人)", _icsa_v, None, "", fmt=","),
+                       unsafe_allow_html=True)
+
+        st.divider()
+
+        # 图表区
+        _ewc1, _ewc2 = st.columns(2)
+
+        with _ewc1:
+            if "10Y-3M利差" in df.columns:
+                _sp3m_s = df["10Y-3M利差"].dropna()
+                _clrs_3m = ["#ef4444" if x < 0 else "#22c55e" for x in _sp3m_s.values]
+                _fig_3m = go.Figure()
+                _fig_3m.add_trace(go.Bar(
+                    x=_sp3m_s.index, y=_sp3m_s.values,
+                    marker_color=_clrs_3m, opacity=0.85, name="10Y-3M",
+                ))
+                _fig_3m.add_hline(y=0, line_color="#d1d5db", line_width=0.8)
+                _fig_3m.update_layout(**mk_layout(
+                    "10Y-3M 利差（红=倒挂 · NY Fed 衰退预测核心变量）",
+                    h=310, show_legend=False))
+                st.plotly_chart(_fig_3m, use_container_width=True)
+                st.caption(
+                    "• 10Y-3M 倒挂是 NY Fed 官方衰退模型的核心输入，预测力强于 10Y-2Y\n"
+                    "• 每次倒挂后平均 6-18 个月出现衰退（Estrella & Mishkin 1998）\n"
+                    f"• 当前衰退概率估算：**{_rec_prob:.1f}%**"
+                )
+            else:
+                st.info("10Y-3M 利差数据加载中（FRED: T10Y3M）")
+
+        with _ewc2:
+            if "Sahm规则指标" in df.columns:
+                _sahm_s = df["Sahm规则指标"].dropna()
+                _fig_sahm = go.Figure()
+                _fig_sahm.add_trace(go.Scatter(
+                    x=_sahm_s.index, y=_sahm_s.values, name="Sahm规则",
+                    line=dict(color="#a855f7", width=2),
+                    fill="tozeroy", fillcolor="rgba(168,85,247,0.08)",
+                ))
+                _fig_sahm.add_hline(y=0.5, line_dash="dash", line_color="#ef4444",
+                                    line_width=1.2,
+                                    annotation_text="0.5 衰退触发线",
+                                    annotation_font=dict(color="#ef4444", size=9))
+                _fig_sahm.add_hline(y=0.3, line_dash="dash", line_color="#f59e0b",
+                                    line_width=0.8,
+                                    annotation_text="0.3 预警线",
+                                    annotation_font=dict(color="#f59e0b", size=9))
+                _fig_sahm.update_layout(**mk_layout(
+                    "Sahm 规则指标（失业率3月均值 − 过去12月最低值）",
+                    h=310, show_legend=False))
+                st.plotly_chart(_fig_sahm, use_container_width=True)
+                st.caption(
+                    "• **Sahm ≥ 0.5**：历史上每次衰退均被准确识别，无漏报记录\n"
+                    "• 由前美联储经济学家 Claudia Sahm 于 2019 年提出，现为 NBER 参考指标\n"
+                    "• 相比 NBER 官方衰退认定，实时性超前约 4-8 个月"
+                )
+            else:
+                st.info("Sahm 规则基于失业率计算（需 FRED: UNRATE）")
+
+        # 初申请失业金趋势
+        if "初申请失业金人数" in df.columns:
+            st.markdown('<div class="section-title">📋 初申请失业金趋势（周频高频领先指标）</div>',
+                        unsafe_allow_html=True)
+            _icsa_s = df["初申请失业金人数"].dropna()
+            _fig_icsa = make_subplots(specs=[[{"secondary_y": True}]])
+            _fig_icsa.add_trace(go.Scatter(
+                x=_icsa_s.index, y=_icsa_s.values, name="初申请(千人)",
+                line=dict(color="#06b6d4", width=1.8),
+                fill="tozeroy", fillcolor="rgba(6,182,212,0.07)",
+            ), secondary_y=False)
+            _icsa_ma4 = _icsa_s.rolling(4).mean()
+            _fig_icsa.add_trace(go.Scatter(
+                x=_icsa_ma4.index, y=_icsa_ma4.values, name="4周均线",
+                line=dict(color="#f59e0b", width=2, dash="dash"),
+            ), secondary_y=False)
+            _fig_icsa.add_hline(
+                y=300, secondary_y=False,
+                line_dash="dash", line_color="#ef4444", line_width=0.8,
+                annotation_text="30万 警戒线",
+                annotation_font=dict(color="#ef4444", size=9),
+            )
+            _lo_ic = mk_layout(
+                "美国初申请失业金人数（千人）— 每周四发布，领先非农约1-2周",
+                h=300)
+            _fig_icsa.update_layout(**_lo_ic)
+            _fig_icsa.update_yaxes(title_text="人数（千）", secondary_y=False, gridcolor=GRID)
+            st.plotly_chart(_fig_icsa, use_container_width=True)
+            st.caption(
+                "• 初申请失业金（Initial Claims）是最高频的劳动市场先行信号，每周四上午8:30公布\n"
+                "• 4周均线升破 **30万人** 通常预示就业市场明显降温，进入衰退风险区\n"
+                "• 2020年3月曾在一周内从20万骤升至600万+，是衰退爆发的极端先行信号"
+            )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Sub2 — 金融压力监测
+    # ────────────────────────────────────────────────────────────────────
+    with ew_sub2:
+        st.markdown('<div class="section-title">💹 金融市场压力综合监测</div>',
+                    unsafe_allow_html=True)
+
+        _ew2c1, _ew2c2 = st.columns(2)
+
+        with _ew2c1:
+            if "金融条件指数" in df.columns:
+                _nfci_s = df["金融条件指数"].dropna()
+                _fig_nfci = go.Figure()
+                _fig_nfci.add_trace(go.Scatter(
+                    x=_nfci_s.index, y=_nfci_s.values, name="NFCI",
+                    line=dict(color="#3b82f6", width=2),
+                    fill="tozeroy", fillcolor="rgba(59,130,246,0.07)",
+                ))
+                _fig_nfci.add_hline(y=0, line_color="#475569", line_width=1,
+                                    annotation_text="历史均值=0",
+                                    annotation_font=dict(color="#475569", size=9))
+                _fig_nfci.add_hline(y=0.3, line_dash="dash", line_color="#ef4444",
+                                    line_width=0.8,
+                                    annotation_text="0.3 偏紧警戒",
+                                    annotation_font=dict(color="#ef4444", size=9))
+                _fig_nfci.update_layout(**mk_layout(
+                    "芝加哥联储金融条件指数 NFCI（<0 宽松 / >0 收紧）",
+                    h=320, show_legend=False))
+                st.plotly_chart(_fig_nfci, use_container_width=True)
+                st.caption(
+                    "NFCI 综合反映信贷市场、股票市场和影子银行系统的金融条件，"
+                    "覆盖 105 个金融指标，历史均值=0，越高越紧"
+                )
+            else:
+                st.info("NFCI 数据加载中（FRED: NFCI）")
+
+        with _ew2c2:
+            if "金融压力指数" in df.columns:
+                _fsi_s = df["金融压力指数"].dropna()
+                _fig_fsi = go.Figure()
+                _fig_fsi.add_trace(go.Scatter(
+                    x=_fsi_s.index, y=_fsi_s.values, name="STLFSI",
+                    line=dict(color="#a855f7", width=2),
+                    fill="tozeroy", fillcolor="rgba(168,85,247,0.07)",
+                ))
+                _fig_fsi.add_hline(y=0, line_color="#475569", line_width=1,
+                                   annotation_text="历史均值=0",
+                                   annotation_font=dict(color="#475569", size=9))
+                _fig_fsi.update_layout(**mk_layout(
+                    "圣路易斯联储金融压力指数 STLFSI（>0 压力上升）",
+                    h=320, show_legend=False))
+                st.plotly_chart(_fig_fsi, use_container_width=True)
+                st.caption(
+                    "STLFSI 基于 18 个金融市场变量（国债/MBS/货币市场/企业债/股权溢价）综合计算，"
+                    "每周更新，是金融压力的高频实时信号"
+                )
+            else:
+                st.info("金融压力指数加载中（FRED: STLFSI4）")
+
+        # VVIX & SKEW
+        _vv_avail = [c for c in ["VVIX", "SKEW指数"] if c in df.columns]
+        if _vv_avail:
+            st.markdown('<div class="section-title">🎲 波动率市场结构 (VVIX / SKEW 指数)</div>',
+                        unsafe_allow_html=True)
+            _fig_vv = go.Figure()
+            for _i, _cnm in enumerate(_vv_avail):
+                _sv = df[_cnm].dropna()
+                if _sv.empty:
+                    continue
+                _fig_vv.add_trace(go.Scatter(
+                    x=_sv.index, y=zscore(_sv).values,
+                    name=_cnm, line=dict(color=COLORS[_i], width=1.8),
+                ))
+            _fig_vv.add_hline(y=0, line_color="#374151", line_width=1)
+            for _lv, _lc in [(2, "#ef4444"), (1, "#f59e0b"), (-1, "#f59e0b"), (-2, "#ef4444")]:
+                _fig_vv.add_hline(y=_lv, line_dash="dash", line_color=_lc, line_width=0.7)
+            _fig_vv.update_layout(**mk_layout(
+                "VVIX（VIX的波动率）& SKEW指数 — Z-Score 标准化", h=300))
+            st.plotly_chart(_fig_vv, use_container_width=True)
+            st.caption(
+                "• **VVIX↑** → VIX本身的波动加剧，市场对短期尾部风险定价的不确定性上升，"
+                "历史上往往出现在市场转折前\n"
+                "• **SKEW↑** → 市场购买更多下行保险（OTM Put），隐含尾部事件预期上升；"
+                "SKEW > 140 通常预警黑天鹅事件担忧"
+            )
+
+        # 工业生产指数
+        if "工业生产指数" in df.columns:
+            st.markdown('<div class="section-title">🏭 工业生产指数（经济周期同步指标）</div>',
+                        unsafe_allow_html=True)
+            _indpro_s = df["工业生产指数"].dropna()
+            _fig_ip = make_subplots(specs=[[{"secondary_y": True}]])
+            _fig_ip.add_trace(go.Scatter(
+                x=_indpro_s.index, y=_indpro_s.values, name="工业生产指数",
+                line=dict(color="#22c55e", width=2),
+            ), secondary_y=False)
+            _ip_mom = _indpro_s.pct_change().dropna() * 100
+            _fig_ip.add_trace(go.Bar(
+                x=_ip_mom.index, y=_ip_mom.values, name="环比(%)",
+                marker_color=["#22c55e" if x >= 0 else "#ef4444" for x in _ip_mom.values],
+                opacity=0.55,
+            ), secondary_y=True)
+            _lo_ip = mk_layout("美国工业生产指数 & 环比变化率（FRED: INDPRO）", h=300)
+            _lo_ip["yaxis2"] = secondary_y_axis()
+            _lo_ip["yaxis2"]["title"] = "环比(%)"
+            _fig_ip.update_layout(**_lo_ip)
+            _fig_ip.update_yaxes(title_text="指数（2017=100）", secondary_y=False, gridcolor=GRID)
+            st.plotly_chart(_fig_ip, use_container_width=True)
+            st.caption(
+                "工业生产指数是 NBER 经济周期识别委员会使用的 4 大官方参考指标之一，"
+                "月频下降连续 2-3 个月通常预示经济步入收缩阶段"
+            )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Sub3 — 大宗商品信号
+    # ────────────────────────────────────────────────────────────────────
+    with ew_sub3:
+        st.markdown('<div class="section-title">🌿 大宗商品宏观信号解读</div>',
+                    unsafe_allow_html=True)
+        st.caption("大宗商品价格体系蕴含全球增长预期、通胀压力和避险情绪的前瞻信号")
+
+        # 铜金比率
+        if "铜金比率" in df.columns:
+            _cau_s = df["铜金比率"].dropna()
+            _ew3c1, _ew3c2 = st.columns([3, 1])
+            with _ew3c1:
+                _fig_cau = make_subplots(specs=[[{"secondary_y": True}]])
+                _fig_cau.add_trace(go.Scatter(
+                    x=_cau_s.index, y=_cau_s.values, name="铜金比率(×1000)",
+                    line=dict(color="#fb923c", width=2),
+                    fill="tozeroy", fillcolor="rgba(251,146,60,0.08)",
+                ), secondary_y=False)
+                if "10Y美债" in df.columns:
+                    _tnx_cau = df["10Y美债"].dropna()
+                    _fig_cau.add_trace(go.Scatter(
+                        x=_tnx_cau.index, y=_tnx_cau.values, name="10Y美债(%)",
+                        line=dict(color="#3b82f6", width=1.4, dash="dash"), opacity=0.8,
+                    ), secondary_y=True)
+                _lo_cau = mk_layout(
+                    "铜金比率（×1000）vs 10Y 美债收益率 — 全球增长信号", h=360)
+                _lo_cau["yaxis2"] = secondary_y_axis()
+                _lo_cau["yaxis2"]["title"] = "10Y美债(%)"
+                _fig_cau.update_layout(**_lo_cau)
+                _fig_cau.update_yaxes(title_text="铜金比率", secondary_y=False, gridcolor=GRID)
+                st.plotly_chart(_fig_cau, use_container_width=True)
+            with _ew3c2:
+                _cau_cur = float(_cau_s.iloc[-1])
+                _cau_z   = float(zscore(_cau_s).iloc[-1]) if len(_cau_s) > 1 else 0.0
+                _cau_pct = (_cau_s < _cau_cur).mean() * 100
+                _cau_col = "#22c55e" if _cau_z > 0 else "#ef4444"
+                _cau_lbl = ("📈 全球增长乐观" if _cau_z > 0.5 else
+                             "📉 增长担忧上升" if _cau_z < -0.5 else "➡️ 中性")
+                st.markdown(f"""
+                <div class="kpi-card" style="padding:20px;margin-top:24px;">
+                  <div class="kpi-label">铜金比率</div>
+                  <div class="kpi-value" style="color:{_cau_col};">{_cau_cur:.3f}</div>
+                  <div class="kpi-label" style="margin-top:10px;">Z-Score</div>
+                  <div style="font-size:18px;font-weight:600;color:#f8fafc;">{_cau_z:+.2f}σ</div>
+                  <div class="kpi-label" style="margin-top:10px;">历史分位</div>
+                  <div style="font-size:16px;font-weight:600;color:#f8fafc;">{_cau_pct:.1f}%</div>
+                  <div style="font-size:11px;color:#475569;margin-top:8px;line-height:1.6;">{_cau_lbl}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.caption(
+                "• **铜金比↑** → 工业需求强于避险需求，市场预期经济强劲，利率通常随之上行\n"
+                "• **铜金比↓** → 避险情绪主导，担忧经济前景，利率通常随之下行\n"
+                "• 铜被称为'有 PhD 的金属'（Dr. Copper），因其与全球经济活动高度正相关"
+            )
+        else:
+            st.info("铜金比率需铜（HG=F）和黄金（GC=F）数据同时可用。")
+
+        st.divider()
+
+        # 全球大宗商品价格基准化对比
+        _comm_sel = [c for c in ["布伦特原油", "原油WTI", "铜", "黄金", "小麦", "玉米", "白银"]
+                     if c in df.columns]
+        if len(_comm_sel) >= 2:
+            st.markdown('<div class="section-title">🌾 全球大宗商品价格（基准化=100）</div>',
+                        unsafe_allow_html=True)
+            _fig_comm = go.Figure()
+            for _i, _cnm in enumerate(_comm_sel):
+                _s_c = df[_cnm].dropna()
+                if _s_c.empty:
+                    continue
+                _fig_comm.add_trace(go.Scatter(
+                    x=_s_c.index,
+                    y=(_s_c / _s_c.iloc[0] * 100).values,
+                    name=_cnm,
+                    line=dict(color=COLORS[_i % len(COLORS)], width=1.8),
+                ))
+            _fig_comm.add_hline(y=100, line_dash="dot",
+                                line_color="#374151", line_width=1)
+            _fig_comm.update_layout(**mk_layout(
+                f"大宗商品价格对比（起点=100，{period_label}）", h=380))
+            st.plotly_chart(_fig_comm, use_container_width=True)
+            st.caption(
+                "• **小麦/玉米↑** → 粮食通胀压力上升，对新兴市场影响尤大\n"
+                "• **布伦特/WTI↑** → 输入型通胀，压缩企业利润率，打压消费信心\n"
+                "• **铜与原油同向上涨** → 需求驱动的大宗商品牛市，经济扩张信号"
+            )
+
+        # 建筑许可（房地产领先指标）
+        if "建筑许可" in df.columns:
+            st.markdown('<div class="section-title">🏠 建筑许可（房地产周期领先指标）</div>',
+                        unsafe_allow_html=True)
+            _permit_s = df["建筑许可"].dropna()
+            _permit_ma3 = _permit_s.rolling(3).mean()
+            _fig_permit = go.Figure()
+            _fig_permit.add_trace(go.Scatter(
+                x=_permit_s.index, y=_permit_s.values, name="建筑许可(千套)",
+                line=dict(color="#f59e0b", width=1.6),
+                fill="tozeroy", fillcolor="rgba(245,158,11,0.07)",
+            ))
+            _fig_permit.add_trace(go.Scatter(
+                x=_permit_ma3.index, y=_permit_ma3.values, name="3月均线",
+                line=dict(color="#ef4444", width=1.8, dash="dash"),
+            ))
+            _fig_permit.update_layout(**mk_layout(
+                "美国建筑许可（千套/月）— 领先经济周期 6-12 个月", h=280))
+            st.plotly_chart(_fig_permit, use_container_width=True)
+            st.caption(
+                "• 建筑许可是 NBER 和 Conference Board LEI 使用的官方领先指标之一\n"
+                "• 领先经济周期约 6-12 个月，持续下滑通常预示经济活动收缩\n"
+                "• 利率上升 → 贷款成本增加 → 建筑许可下降，呈现典型的货币政策传导链"
+            )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Footer — 数据源状态
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2094,7 +2549,7 @@ with st.expander("📡 数据源状态一览", expanded=False):
 
 st.markdown("""
 <div style='text-align:center;padding:16px 0 6px;font-size:11px;color:#1f2937;'>
-  宏观风险监控平台 v3.0 &nbsp;·&nbsp;
+  宏观风险监控平台 v4.0 &nbsp;·&nbsp;
   数据来源：yfinance · akshare · FRED &nbsp;·&nbsp;
   仅供研究参考，不构成任何投资建议
 </div>
