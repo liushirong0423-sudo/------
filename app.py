@@ -911,8 +911,9 @@ def recession_probability(spread_10y_3m) -> float:
     """
     if spread_10y_3m is None:
         return 0.0
+    import math
     z = -0.5779 + (-0.8045) * float(spread_10y_3m)
-    return float((1.0 + np.erf(z / np.sqrt(2.0))) / 2.0 * 100.0)
+    return float((1.0 + math.erf(z / math.sqrt(2.0))) / 2.0 * 100.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
