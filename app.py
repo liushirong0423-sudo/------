@@ -124,6 +124,9 @@ YFINANCE_EQUITY = {
     "道琼斯":     "^DJI",
     "罗素2000":   "^RUT",
     "MSCI新兴市场": "EEM",
+    "日经225":    "^N225",
+    "德国DAX":    "^GDAXI",
+    "英国富时100": "^FTSE",
 }
 YFINANCE_RATES = {
     "2Y美债":  "^IRX",
@@ -171,6 +174,7 @@ FRED_SERIES = {
     "美投资级债利差":  "BAMLC0A0CM",
     "M2货币供应":      "M2SL",
     "密歇根消费信心":  "UMCSENT",
+    "联邦基金利率":    "FEDFUNDS",
 }
 
 PERIOD_MAP = {"1Y": 365, "3Y": 1095, "5Y": 1825, "Max": 3650}
@@ -400,6 +404,83 @@ def fetch_cn_macro(days: int) -> dict:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cn_indices(days: int) -> dict:
+    """获取中国A股主要指数（akshare）"""
+    result = {}
+    cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
+    try:
+        import akshare as ak
+        index_map = {
+            "上证综指": "sh000001",
+            "创业板指": "sz399006",
+            "中证500":  "sh000905",
+            "科创50":   "sh000688",
+        }
+        for name, symbol in index_map.items():
+            try:
+                df_idx = ak.stock_zh_index_daily(symbol=symbol)
+                df_idx.index = pd.to_datetime(df_idx["date"])
+                s = pd.to_numeric(df_idx["close"], errors="coerce").dropna()
+                s.name = name
+                s = s[s.index >= cutoff]
+                if not s.empty:
+                    result[name] = s
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cn_macro_extended(days: int) -> dict:
+    """获取中国扩展宏观数据：PPI、财新PMI、M2同比"""
+    result = {}
+    cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
+    try:
+        import akshare as ak
+        # 中国PPI同比
+        try:
+            ppi = ak.macro_china_ppi_yearly()
+            if ppi is not None and not ppi.empty:
+                ppi.index = pd.to_datetime(ppi.iloc[:, 0])
+                vc = next((c for c in ppi.columns if "今值" in c or c == ppi.columns[1]), None)
+                if vc:
+                    s = pd.to_numeric(ppi[vc], errors="coerce").dropna()
+                    s.name = "中国PPI同比"
+                    result["中国PPI同比"] = s[s.index >= cutoff]
+        except Exception:
+            pass
+        # 财新PMI制造业
+        try:
+            pmi_cx = ak.macro_china_caixin_pmi_yearly()
+            if pmi_cx is not None and not pmi_cx.empty:
+                pmi_cx.index = pd.to_datetime(pmi_cx.iloc[:, 0])
+                vc = next((c for c in pmi_cx.columns if "今值" in c or c == pmi_cx.columns[1]), None)
+                if vc:
+                    s = pd.to_numeric(pmi_cx[vc], errors="coerce").dropna()
+                    s.name = "财新PMI制造业"
+                    result["财新PMI制造业"] = s[s.index >= cutoff]
+        except Exception:
+            pass
+        # 中国M2同比
+        try:
+            m2 = ak.macro_china_m2_yearly()
+            if m2 is not None and not m2.empty:
+                m2.index = pd.to_datetime(m2.iloc[:, 0])
+                vc = next((c for c in m2.columns if "今值" in c or c == m2.columns[1]), None)
+                if vc:
+                    s = pd.to_numeric(m2[vc], errors="coerce").dropna()
+                    s.name = "中国M2同比"
+                    result["中国M2同比"] = s[s.index >= cutoff]
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_all(days: int):
     """汇总所有数据源 → 宽表 DataFrame + 状态字典"""
     data, status = {}, {}
@@ -454,6 +535,27 @@ def load_all(days: int):
     for nm, s in fetch_cn_macro(days).items():
         data[nm]   = s
         status[nm] = "ok"
+
+    # 中国A股主要指数
+    for nm, s in fetch_cn_indices(days).items():
+        data[nm]   = s
+        status[nm] = "ok"
+
+    # 中国扩展宏观数据（PPI、财新PMI、M2同比）
+    for nm, s in fetch_cn_macro_extended(days).items():
+        data[nm]   = s
+        status[nm] = "ok"
+
+    # 中美利差（美国10Y − 中国10Y，日频对齐）
+    _us10 = data.get("10Y美债")
+    _cn10 = data.get("中国10Y国债")
+    if _us10 is not None and _cn10 is not None:
+        _idx = _us10.index.intersection(_cn10.index)
+        if len(_idx) > 20:
+            _sp = _us10.loc[_idx] - _cn10.loc[_idx]
+            _sp.name = "中美利差(10Y)"
+            data["中美利差(10Y)"]   = _sp.dropna()
+            status["中美利差(10Y)"] = "ok"
 
     if not data:
         return pd.DataFrame(), status
@@ -517,6 +619,229 @@ def add_bands(fig, s: pd.Series, row=1, col=1):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 宏观情景诊断引擎
+# ═══════════════════════════════════════════════════════════════════════════
+def build_macro_regime(df_: pd.DataFrame, V_: dict, spread_102_) -> dict:
+    """
+    分析宏观指标，返回：
+    regime, regime_color, regime_desc, regime_assets,
+    signals, watch_list, anomalies
+    """
+    signals    = {}   # key → (icon, value_str, description)
+    watch_list = []   # [(indicator, reason)]
+
+    # ── 通胀 ──
+    cpi  = V_.get("美国CPI同比")
+    be10 = safe_val(df_, "10Y盈亏平衡通胀")
+    if cpi is not None:
+        if cpi > 4:
+            signals["通胀"] = ("🔴", f"CPI {cpi:.1f}%", "高通胀：远超2%目标，货币政策收紧压力大")
+            watch_list.append(("美国CPI同比", f"当前{cpi:.1f}%，远超2%目标，警惕加息预期持续抬升"))
+        elif cpi > 2.5:
+            signals["通胀"] = ("🟡", f"CPI {cpi:.1f}%", "通胀偏高：高于目标，粘性风险需关注")
+            watch_list.append(("美国CPI同比", f"当前{cpi:.1f}%，通胀粘性，关注降息路径"))
+        else:
+            signals["通胀"] = ("🟢", f"CPI {cpi:.1f}%", "通胀受控：接近或低于2%目标")
+    if be10 is not None and be10 > 2.5:
+        watch_list.append(("10Y盈亏平衡通胀", f"市场通胀预期{be10:.2f}%，高于美联储目标，警惕脱锚"))
+
+    # ── 就业/增长 ──
+    unrate = V_.get("美国失业率")
+    if unrate is not None:
+        if unrate > 5.5:
+            signals["就业"] = ("🔴", f"失业率 {unrate:.1f}%", "就业明显恶化：衰退信号确认")
+            watch_list.append(("美国失业率", f"升至{unrate:.1f}%，衰退概率大幅上升"))
+        elif unrate > 4.5:
+            signals["就业"] = ("🟡", f"失业率 {unrate:.1f}%", "就业放缓：劳动市场降温，关注趋势")
+            watch_list.append(("美国失业率", f"{unrate:.1f}%，关注就业趋势是否持续恶化"))
+        else:
+            signals["就业"] = ("🟢", f"失业率 {unrate:.1f}%", "就业健康：劳动市场依然强劲")
+
+    # ── 收益率曲线 ──
+    if spread_102_ is not None:
+        if spread_102_ < -0.5:
+            signals["收益率曲线"] = ("🔴", f"10Y-2Y={spread_102_:+.2f}%", "深度倒挂：历史预测衰退准确率极高，滞后12-18月")
+            watch_list.append(("10Y-2Y利差", f"深度倒挂{spread_102_:+.2f}%，衰退风险极高"))
+        elif spread_102_ < 0:
+            signals["收益率曲线"] = ("🟡", f"10Y-2Y={spread_102_:+.2f}%", "轻度倒挂：衰退信号，需结合其他指标确认")
+            watch_list.append(("10Y-2Y利差", f"倒挂{spread_102_:+.2f}%，保持持续关注"))
+        elif spread_102_ < 0.5:
+            signals["收益率曲线"] = ("🟡", f"10Y-2Y={spread_102_:+.2f}%", "曲线平坦：期限溢价偏低，市场预期增长放缓")
+        else:
+            signals["收益率曲线"] = ("🟢", f"10Y-2Y={spread_102_:+.2f}%", "曲线正常：期限溢价健康，经济预期良好")
+
+    # ── 信用风险 ──
+    hy = V_.get("美高收益债利差")
+    if hy is not None:
+        if hy > 600:
+            signals["信用风险"] = ("🔴", f"HY={hy:.0f}bps", "信用极度压力：系统性风险高企，危机水平")
+            watch_list.append(("美高收益债利差", f"HY利差{hy:.0f}bps，已达信用危机信号"))
+        elif hy > 400:
+            signals["信用风险"] = ("🟡", f"HY={hy:.0f}bps", "信用利差走阔：风险偏好下降，关注违约率")
+            watch_list.append(("美高收益债利差", f"{hy:.0f}bps超400bps警戒线，需持续跟踪"))
+        else:
+            signals["信用风险"] = ("🟢", f"HY={hy:.0f}bps", "信用市场平稳：违约风险可控")
+
+    # ── 市场波动率 ──
+    vix = V_.get("VIX")
+    if vix is not None:
+        if vix > 35:
+            signals["波动率"] = ("🔴", f"VIX={vix:.1f}", "极度恐慌：历史大底往往在此区间出现，短期风险极高")
+            watch_list.append(("VIX恐慌指数", f"VIX={vix:.1f}，市场极度恐慌，系统性事件信号"))
+        elif vix > 25:
+            signals["波动率"] = ("🟡", f"VIX={vix:.1f}", "市场恐慌升温：突破25警戒线，注意风险敞口")
+            watch_list.append(("VIX恐慌指数", f"突破25警戒线（当前{vix:.1f}），注意仓位管理"))
+        elif vix > 18:
+            signals["波动率"] = ("🟡", f"VIX={vix:.1f}", "波动率偏高：市场不确定性上升，注意节奏")
+        else:
+            signals["波动率"] = ("🟢", f"VIX={vix:.1f}", "低波动：市场情绪平稳，警惕自满情绪")
+
+    # ── 美元 ──
+    dxy = V_.get("美元指数")
+    if dxy is not None:
+        if dxy > 108:
+            signals["美元"] = ("🔴", f"DXY={dxy:.1f}", "美元极强：新兴市场面临资本外流和债务压力")
+            watch_list.append(("美元指数", f"DXY={dxy:.1f}，强美元压制新兴市场、大宗商品及人民币"))
+        elif dxy > 104:
+            signals["美元"] = ("🟡", f"DXY={dxy:.1f}", "美元偏强：全球流动性相对收紧")
+        else:
+            signals["美元"] = ("🟢", f"DXY={dxy:.1f}", "美元中性偏弱：有利于新兴市场和大宗商品")
+
+    # ── 美联储流动性 ──
+    if "美联储净流动性" in df_.columns:
+        fl_s = df_["美联储净流动性"].dropna()
+        if len(fl_s) > 1:
+            fl_z = float(zscore(fl_s).iloc[-1])
+            fl_v = float(fl_s.iloc[-1])
+            if fl_z > 0.5:
+                signals["流动性"] = ("🟢", f"{fl_v:,.0f}B$", "流动性宽裕：净流动性偏高，利好风险资产")
+            elif fl_z < -0.5:
+                signals["流动性"] = ("🔴", f"{fl_v:,.0f}B$", "流动性偏紧：净流动性偏低，压制风险资产")
+                watch_list.append(("美联储净流动性", f"Z-Score={fl_z:+.2f}σ，流动性偏紧，关注市场承压"))
+            else:
+                signals["流动性"] = ("🟡", f"{fl_v:,.0f}B$", "流动性中性：关注后续美联储操作动向")
+
+    # ── 中国经济 ──
+    cn_pmi = safe_val(df_, "中国PMI制造业")
+    if cn_pmi is None:
+        cn_pmi = safe_val(df_, "财新PMI制造业")
+    if cn_pmi is not None:
+        if cn_pmi < 49:
+            signals["中国PMI"] = ("🔴", f"PMI={cn_pmi:.1f}", "中国制造业萎缩：全球需求下行压力，大宗商品承压")
+            watch_list.append(("中国PMI制造业", f"PMI={cn_pmi:.1f}，低于荣枯线，关注中国经济走弱的全球传导"))
+        elif cn_pmi < 50.5:
+            signals["中国PMI"] = ("🟡", f"PMI={cn_pmi:.1f}", "中国制造业接近荣枯线：经济动能偏弱，政策窗口期")
+            watch_list.append(("中国PMI制造业", f"PMI={cn_pmi:.1f}，接近荣枯线，关注政策刺激力度"))
+        else:
+            signals["中国PMI"] = ("🟢", f"PMI={cn_pmi:.1f}", "中国制造业扩张：有利于大宗商品和全球需求")
+
+    # ── 中美利差 ──
+    cn_us_sp = safe_val(df_, "中美利差(10Y)")
+    if cn_us_sp is not None:
+        if cn_us_sp < -1.0:
+            signals["中美利差"] = ("🔴", f"中美={cn_us_sp:+.2f}%", "美国相对中国利差大幅为正：资金明显流向美国，人民币承压")
+            watch_list.append(("中美利差(10Y)", f"利差{cn_us_sp:+.2f}%，资金流出压力大，关注人民币汇率"))
+        elif cn_us_sp < 0:
+            signals["中美利差"] = ("🟡", f"中美={cn_us_sp:+.2f}%", "美国利率高于中国：资本流出压力存在")
+        else:
+            signals["中美利差"] = ("🟢", f"中美={cn_us_sp:+.2f}%", "中国利率高于美国：利差支撑人民币和A股外资流入")
+
+    # ── 宏观情景四象限判断 ──
+    growth_ok   = signals.get("就业",      ("🟢",))[0] == "🟢"
+    infla_high  = signals.get("通胀",      ("🟢",))[0] in ("🔴", "🟡")
+    be10_high   = be10 > 2.5 if be10 is not None else False
+
+    if growth_ok and not (infla_high or be10_high):
+        regime       = "Goldilocks · 金发女孩"
+        regime_color = "#22c55e"
+        regime_desc  = ("经济增长健康，通胀受控。历史上最有利于风险资产的宏观组合。"
+                        "成长股、科技股、信用债均倾向表现良好，建议适度偏多风险资产。")
+        regime_assets = {
+            "美股":   "🟢 超配（成长/科技）",
+            "A股":    "🟢 超配",
+            "港股":   "🟢 超配",
+            "黄金":   "🟡 中性",
+            "大宗商品": "🟡 中性",
+            "长期国债": "🟡 中性",
+            "现金":   "🔴 低配",
+        }
+    elif growth_ok and (infla_high or be10_high):
+        regime       = "Reflation · 再通胀"
+        regime_color = "#f59e0b"
+        regime_desc  = ("经济扩张但通胀压力上升。有利于周期性资产、大宗商品和TIPS，"
+                        "名义长债承压，成长股相对价值股劣势。关注货币政策转向时点。")
+        regime_assets = {
+            "美股":   "🟡 中性（偏周期/价值）",
+            "A股":    "🟡 关注政策节奏",
+            "港股":   "🟡 中性",
+            "黄金":   "🟡 中性（TIPS更优）",
+            "大宗商品": "🟢 超配（能源/铜）",
+            "长期国债": "🔴 低配",
+            "现金":   "🟡 中性",
+        }
+    elif not growth_ok and (infla_high or be10_high):
+        regime       = "Stagflation · 滞胀"
+        regime_color = "#ef4444"
+        regime_desc  = ("经济放缓但通胀高企，是最难应对的宏观环境。黄金、能源类大宗商品和"
+                        "短久期债券相对抗跌，股票（尤其成长股）和长债均承压，建议提高防御性。")
+        regime_assets = {
+            "美股":   "🔴 低配（防御为主）",
+            "A股":    "🔴 谨慎",
+            "港股":   "🔴 谨慎",
+            "黄金":   "🟢 超配",
+            "大宗商品": "🟢 超配（能源）",
+            "长期国债": "🔴 低配",
+            "现金":   "🟢 超配",
+        }
+    else:
+        regime       = "Deflation · 通缩/衰退"
+        regime_color = "#3b82f6"
+        regime_desc  = ("经济萎缩，通胀下行。长期国债、黄金和防御性股票通常有较好表现，"
+                        "高收益债和周期股承压。等待政策宽松信号（降息/QE）再布局风险资产。")
+        regime_assets = {
+            "美股":   "🟡 防御板块为主",
+            "A股":    "🟡 政策刺激预期",
+            "港股":   "🟡 谨慎",
+            "黄金":   "🟢 超配",
+            "大宗商品": "🔴 低配",
+            "长期国债": "🟢 超配",
+            "现金":   "🟢 超配",
+        }
+
+    # ── 异常偏离检测（Z-Score绝对值最大的8个指标）──
+    anomalies = []
+    for col in df_.columns:
+        s = df_[col].dropna()
+        if len(s) < 30 or col.endswith("_PE"):
+            continue
+        zs = float(zscore(s).iloc[-1])
+        if abs(zs) > 1.5:
+            anomalies.append((col, zs, float(s.iloc[-1])))
+    anomalies.sort(key=lambda x: abs(x[1]), reverse=True)
+    anomalies = anomalies[:8]
+
+    # ── 综合风险评分（满分11分）──
+    risk_score = 0
+    for key, thr_r, thr_y in [
+        ("通胀",       2, 1), ("就业",    2, 1), ("收益率曲线", 2, 1),
+        ("信用风险",   2, 1), ("波动率",  2, 1), ("流动性",    1, 0),
+    ]:
+        icon = signals.get(key, ("🟢",))[0]
+        risk_score += thr_r if icon == "🔴" else (thr_y if icon == "🟡" else 0)
+
+    return {
+        "regime":        regime,
+        "regime_color":  regime_color,
+        "regime_desc":   regime_desc,
+        "regime_assets": regime_assets,
+        "signals":       signals,
+        "watch_list":    watch_list[:8],
+        "anomalies":     anomalies,
+        "risk_score":    risk_score,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 侧边栏
 # ═══════════════════════════════════════════════════════════════════════════
 with st.sidebar:
@@ -545,8 +870,9 @@ with st.sidebar:
         ["VIX"] +
         list(YFINANCE_FX.keys()) +
         list(YFINANCE_COMMODITY.keys()) +
-        ["中国10Y国债","沪深300","恒生指数","美联储净流动性",
-         "美国CPI同比","美高收益债利差","TIPS_10Y实际利率","M2货币供应"]
+        ["中国10Y国债","沪深300","恒生指数","上证综指","创业板指","中证500","科创50",
+         "美联储净流动性","美国CPI同比","美高收益债利差","TIPS_10Y实际利率",
+         "M2货币供应","中美利差(10Y)","联邦基金利率"]
     )
     canvas_sel = st.multiselect(
         "叠加指标（多选）", CANVAS_OPTS,
@@ -607,12 +933,13 @@ st.markdown(f"""
 # ═══════════════════════════════════════════════════════════════════════════
 # 5 个主 Tab
 # ═══════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🎯 风险仪表盘",
     "🌍 全球市场",
     "🔬 万能画布",
     "💰 股债利差 ERP",
     "🔗 深度分析",
+    "🧠 综合诊断",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -623,8 +950,9 @@ with tab1:
     V = {k: safe_val(df, k) for k in [
         "纳斯达克100","标普500","VIX","10Y美债","2Y美债",
         "美元指数","黄金","原油WTI","中国10Y国债","恒生指数",
-        "沪深300","美联储净流动性","美高收益债利差",
-        "TIPS_10Y实际利率","美国CPI同比","美国失业率",
+        "沪深300","上证综指","创业板指","美联储净流动性","美高收益债利差",
+        "TIPS_10Y实际利率","美国CPI同比","美国失业率","中美利差(10Y)",
+        "联邦基金利率",
     ]}
     CHG = {k: daily_chg(df, k) for k in V}
 
@@ -738,6 +1066,58 @@ with tab1:
     r3[2].markdown(kpi("中国10Y国债", V["中国10Y国债"], None, "%", fmt=""),           unsafe_allow_html=True)
     r3[3].markdown(kpi("HY信用利差",  V["美高收益债利差"], None, "bps"),              unsafe_allow_html=True)
     r3[4].markdown(kpi("美联储净流动性",V["美联储净流动性"], None, "B$"),             unsafe_allow_html=True)
+
+    r4 = st.columns(5)
+    r4[0].markdown(kpi("上证综指",    V["上证综指"],    CHG["上证综指"]),              unsafe_allow_html=True)
+    r4[1].markdown(kpi("创业板指",    V["创业板指"],    CHG["创业板指"]),              unsafe_allow_html=True)
+    r4[2].markdown(kpi("中美利差10Y", V["中美利差(10Y)"], None, "%", fmt="+"),        unsafe_allow_html=True)
+    r4[3].markdown(kpi("联邦基金利率",V["联邦基金利率"],  None, "%", fmt=""),          unsafe_allow_html=True)
+    r4[4].markdown(kpi("日经225",     safe_val(df, "日经225"),  daily_chg(df, "日经225")), unsafe_allow_html=True)
+
+    # ── 宏观情景诊断 ────────────────────────────────────────────────────
+    st.markdown('<div class="section-title">🧠 宏观情景诊断</div>', unsafe_allow_html=True)
+    mc1 = build_macro_regime(df, V, spread_10_2)
+    _ca1, _ca2 = st.columns([1, 2])
+    with _ca1:
+        _rc = mc1["regime_color"]
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#0d1321,{_rc}18);
+                    border:1px solid {_rc}55;border-radius:12px;padding:20px;">
+          <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;font-weight:600;">当前宏观情景</div>
+          <div style="font-size:19px;font-weight:700;color:{_rc};margin:8px 0 6px;">{mc1['regime']}</div>
+          <div style="font-size:11px;color:#94a3b8;line-height:1.7;">{mc1['regime_desc']}</div>
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid #1e2a3a;">
+            <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;">综合风险评分</div>
+            <div style="font-size:22px;font-weight:700;color:{'#ef4444' if mc1['risk_score']>=8 else ('#f59e0b' if mc1['risk_score']>=5 else ('#3b82f6' if mc1['risk_score']>=3 else '#22c55e'))};">
+              {mc1['risk_score']}/11
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with _ca2:
+        _sig_items = list(mc1['signals'].items())
+        _scols = st.columns(4)
+        for _i, (_key, (_icon, _val, _desc)) in enumerate(_sig_items):
+            _bc = "#ef4444" if _icon=="🔴" else ("#f59e0b" if _icon=="🟡" else "#22c55e")
+            _scols[_i % 4].markdown(f"""
+            <div style="background:#0d1321;border:1px solid {_bc}33;border-left:3px solid {_bc};
+                        border-radius:8px;padding:10px 12px;margin:3px 0;min-height:80px;">
+              <div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">{_key}</div>
+              <div style="font-size:13px;font-weight:700;color:#f8fafc;margin:4px 0 2px;">{_icon} {_val}</div>
+              <div style="font-size:9px;color:#64748b;line-height:1.4;">{_desc[:45]}{'…' if len(_desc)>45 else ''}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── 关注指标清单 ────────────────────────────────────────────────────
+    if mc1['watch_list']:
+        st.markdown('<div class="section-title">📌 本期重点关注指标</div>', unsafe_allow_html=True)
+        _wl_cols = st.columns(4)
+        for _i, (_ind, _reason) in enumerate(mc1['watch_list'][:8]):
+            _wl_cols[_i % 4].markdown(
+                f'<div class="alert-card alert-yellow">'
+                f'<div class="alert-title">📍 {_ind}</div>'
+                f'<div class="alert-desc">{_reason}</div></div>',
+                unsafe_allow_html=True
+            )
 
     st.divider()
 
@@ -859,7 +1239,8 @@ with tab2:
     # ── 全球股指（基准=100）────────────────────────────────────────────
     st.markdown('<div class="section-title">🌍 全球股指走势（基准化 = 100）</div>',
                 unsafe_allow_html=True)
-    eq_cols = [c for c in list(YFINANCE_EQUITY.keys()) + ["沪深300","恒生指数"]
+    eq_cols = [c for c in list(YFINANCE_EQUITY.keys()) +
+               ["沪深300","恒生指数","上证综指","创业板指","中证500"]
                if c in df.columns]
     if eq_cols:
         fig_eq = go.Figure()
@@ -1043,7 +1424,7 @@ with tab4:
                 unsafe_allow_html=True)
     st.caption("ERP = 盈利收益率 (100/PE) − 10Y国债收益率（%）。ERP↑ → 股票性价比提升")
 
-    etabs = st.tabs(["A股 ERP", "美股 ERP", "实际利率体系", "完整收益率曲线"])
+    etabs = st.tabs(["A股 ERP", "美股 ERP", "实际利率体系", "完整收益率曲线", "🌏 中美利差"])
 
     # A股 ERP
     with etabs[0]:
@@ -1185,6 +1566,103 @@ with tab4:
                     fig_snap.update_layout(**lo_s)
                     st.plotly_chart(fig_snap, use_container_width=True)
 
+    # ── 中美利差 ──────────────────────────────────────────────────────
+    with etabs[4]:
+        st.markdown('<div class="section-title">🌏 中美利差 & 全球国债比较</div>',
+                    unsafe_allow_html=True)
+        st.caption("中美利差 = 美国10Y − 中国10Y。利差为负表示资金倾向流向美国，人民币汇率承压；利差为正则反之。")
+
+        if "中美利差(10Y)" in df.columns:
+            cn_us_sp = df["中美利差(10Y)"].dropna()
+            _cl, _cr = st.columns([3, 1])
+            with _cl:
+                fig_cnus = make_subplots(specs=[[{"secondary_y": True}]])
+                for _nm, _col in [("10Y美债","#3b82f6"),("中国10Y国债","#ef4444")]:
+                    if _nm in df.columns:
+                        _s = df[_nm].dropna()
+                        fig_cnus.add_trace(go.Scatter(
+                            x=_s.index, y=_s.values, name=_nm,
+                            line=dict(color=_col, width=1.8),
+                        ), secondary_y=False)
+                fig_cnus.add_trace(go.Scatter(
+                    x=cn_us_sp.index, y=cn_us_sp.values,
+                    name="中美利差 (US−CN, %)",
+                    line=dict(color="#a855f7", width=1.5, dash="dash"),
+                    fill="tozeroy", fillcolor="rgba(168,85,247,0.07)",
+                ), secondary_y=True)
+                fig_cnus.add_hline(y=0, secondary_y=True,
+                                   line_color="#374151", line_width=1,
+                                   annotation_text="利差=0",
+                                   annotation_font=dict(color="#475569", size=9))
+                lo_cn = mk_layout("中美10年期国债收益率 & 利差（美国 − 中国）", h=400)
+                lo_cn["yaxis2"] = secondary_y_axis()
+                lo_cn["yaxis2"]["title"] = "利差 (%)"
+                fig_cnus.update_layout(**lo_cn)
+                fig_cnus.update_yaxes(title_text="收益率 (%)", secondary_y=False, gridcolor=GRID)
+                st.plotly_chart(fig_cnus, use_container_width=True)
+            with _cr:
+                _cur_sp = float(cn_us_sp.iloc[-1]) if not cn_us_sp.empty else None
+                if _cur_sp is not None:
+                    _z_sp  = float(zscore(cn_us_sp).iloc[-1]) if len(cn_us_sp) > 1 else 0
+                    _pct_sp = (cn_us_sp < _cur_sp).mean() * 100
+                    _col_sp = "#ef4444" if _cur_sp < 0 else "#22c55e"
+                    _lbl_sp = ("🔴 美国利率更高，资金偏向流出中国"
+                               if _cur_sp < 0 else
+                               "🟢 中国利率更高，利差支撑人民币")
+                    st.markdown(f"""
+                    <div class="kpi-card" style="padding:20px;margin-top:24px;">
+                      <div class="kpi-label">中美10Y利差</div>
+                      <div class="kpi-value" style="color:{_col_sp};">{_cur_sp:+.2f}%</div>
+                      <div class="kpi-label" style="margin-top:10px;">Z-Score</div>
+                      <div style="font-size:18px;font-weight:600;color:#f8fafc;">{_z_sp:+.2f}σ</div>
+                      <div class="kpi-label" style="margin-top:10px;">历史分位</div>
+                      <div style="font-size:16px;font-weight:600;color:#f8fafc;">{_pct_sp:.1f}%</div>
+                      <div style="font-size:11px;color:#475569;margin-top:10px;line-height:1.5;">{_lbl_sp}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # 全球国债快照柱图
+            st.markdown('<div class="section-title">🌐 中美国债收益率结论</div>',
+                        unsafe_allow_html=True)
+            _v_us  = safe_val(df, "10Y美债")
+            _v_cn  = safe_val(df, "中国10Y国债")
+            _v_ffr = safe_val(df, "联邦基金利率")
+            _bond_data = [
+                ("美国10Y国债", _v_us,  "#3b82f6"),
+                ("中国10Y国债", _v_cn,  "#ef4444"),
+                ("美联储基准利率", _v_ffr, "#f59e0b"),
+            ]
+            _bond_data = [(n, v, c) for n, v, c in _bond_data if v is not None]
+            if _bond_data:
+                _fig_gb = go.Figure(go.Bar(
+                    x=[r[0] for r in _bond_data],
+                    y=[r[1] for r in _bond_data],
+                    marker_color=[r[2] for r in _bond_data],
+                    text=[f"{r[1]:.2f}%" for r in _bond_data],
+                    textposition="outside",
+                    textfont=dict(color="#94a3b8", size=11),
+                ))
+                _fig_gb.update_layout(**mk_layout(
+                    "关键利率水平对比（%）", h=300, show_legend=False))
+                st.plotly_chart(_fig_gb, use_container_width=True)
+
+            # 结论文字
+            if _cur_sp is not None and _v_us is not None and _v_cn is not None:
+                _concl_color = "#ef4444" if _cur_sp < -1 else ("#f59e0b" if _cur_sp < 0 else "#22c55e")
+                _concl = (
+                    f"当前美国10Y（{_v_us:.2f}%）{'高于' if _cur_sp > 0 else '低于'}"
+                    f"中国10Y（{_v_cn:.2f}%），利差为 **{_cur_sp:+.2f}%**。"
+                )
+                if _cur_sp < -1:
+                    _concl += "美国利率大幅高于中国，跨境资本存在较强的流向美国动力，人民币面临贬值压力，A股外资流入受到抑制。建议关注中国央行的汇率调控动作和北向资金动态。"
+                elif _cur_sp < 0:
+                    _concl += "美国利率略高于中国，汇率承压但尚属可控，需持续跟踪利差走势变化。"
+                else:
+                    _concl += "中国利率高于美国，利差有助于吸引外资流入中国债券市场，对人民币汇率形成支撑，利好A股和港股外资回流。"
+                st.info(_concl)
+        else:
+            st.info("中美利差数据加载中，需要中国10Y国债（akshare）和美国10Y国债（yfinance）同时可用。")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # TAB 5 — 深度分析
@@ -1205,9 +1683,16 @@ with tab5:
             st.warning("有效序列不足，请刷新后重试。")
         else:
             df_ret  = df[heat_cols].pct_change().dropna(how="all")
+            # ── 关键修复：过滤月度/低频FRED序列 ──────────────────────
+            # 月度数据（CPI、PMI、M2等）在日度DataFrame中密度仅约4-5%，
+            # 与日频数据混算会导致相关性严重失真（样本量不匹配）。
+            # 通过密度筛选确保只有日/周频数据参与相关性计算。
+            ret_density   = df_ret.notna().mean()
+            high_freq_cols = ret_density[ret_density > 0.10].index.tolist()
+            df_ret  = df_ret[high_freq_cols]
             df_ret  = df_ret.dropna(axis=1, thresh=int(len(df_ret) * 0.4))
             heat_cols = list(df_ret.columns)
-            corr    = df_ret.corr()
+            corr    = df_ret.corr(method="pearson")
             # 截断过长标签
             labels  = [c[:9] if len(c) > 9 else c for c in corr.columns]
 
@@ -1324,7 +1809,9 @@ with tab5:
             st.info("美国宏观数据加载中（FRED API），请稍后刷新。")
 
         # 中国宏观
-        cn_m_cols = [c for c in ["中国CPI同比","中国PMI制造业"] if c in df.columns]
+        cn_m_cols = [c for c in [
+            "中国CPI同比","中国PPI同比","中国PMI制造业","财新PMI制造业","中国M2同比"
+        ] if c in df.columns]
         if cn_m_cols:
             st.markdown('<div class="section-title">🇨🇳 中国宏观经济指标（akshare）</div>',
                         unsafe_allow_html=True)
@@ -1417,22 +1904,197 @@ with tab5:
                 f"{roll_col} · {roll_win}日滚动 Z-Score（绿=正常 / 橙=1σ / 红=2σ）", h=280))
             st.plotly_chart(fig_r3, use_container_width=True)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 6 — 综合诊断
+# ══════════════════════════════════════════════════════════════════════════
+with tab6:
+    # 复用 Tab1 计算结果（Python with块不创建新作用域，V/spread_10_2 仍在域内）
+    mc = build_macro_regime(df, V, spread_10_2)
+
+    # ── 宏观情景总览 ────────────────────────────────────────────────────
+    st.markdown('<div class="section-title">🎯 宏观情景总判断</div>', unsafe_allow_html=True)
+    _reg_col = mc["regime_color"]
+    _rs = mc["risk_score"]
+    _rs_color = ("#ef4444" if _rs >= 8 else
+                 "#f59e0b" if _rs >= 5 else
+                 "#3b82f6" if _rs >= 3 else "#22c55e")
+    _rs_label = ("极高风险" if _rs >= 8 else
+                 "高风险"   if _rs >= 5 else
+                 "中等风险" if _rs >= 3 else "低风险")
+
+    _col_r1, _col_r2, _col_r3 = st.columns([2, 1, 3])
+    with _col_r1:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#0d1321,{_reg_col}18);
+                    border:1px solid {_reg_col}55;border-radius:12px;padding:24px;">
+          <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;font-weight:600;">当前宏观情景</div>
+          <div style="font-size:22px;font-weight:700;color:{_reg_col};margin:10px 0 8px;">{mc['regime']}</div>
+          <div style="font-size:12px;color:#94a3b8;line-height:1.7;">{mc['regime_desc']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with _col_r2:
+        st.markdown(f"""
+        <div style="background:#0d1321;border:1px solid {_rs_color}55;border-radius:12px;
+                    padding:24px;text-align:center;height:100%;">
+          <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;font-weight:600;">综合风险评分</div>
+          <div style="font-size:42px;font-weight:800;color:{_rs_color};margin:8px 0;">{_rs}</div>
+          <div style="font-size:13px;color:{_rs_color};font-weight:600;">/ 11 · {_rs_label}</div>
+          <div style="font-size:10px;color:#475569;margin-top:8px;line-height:1.5;">
+            通胀/就业/曲线<br>信用/波动率/流动性
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with _col_r3:
+        st.markdown("**各类资产配置参考信号**")
+        _asset_rows = []
+        for _asset, _sig in mc["regime_assets"].items():
+            _ac = ("#22c55e" if "超配" in _sig else
+                   "#ef4444" if any(x in _sig for x in ["低配","谨慎"]) else
+                   "#f59e0b")
+            _asset_rows.append({"资产类别": _asset, "配置信号": _sig, "颜色参考": _ac})
+        _df_a = pd.DataFrame(_asset_rows)[["资产类别","配置信号"]]
+        st.dataframe(_df_a, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── 信号面板 ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-title">🔍 宏观指标信号面板</div>', unsafe_allow_html=True)
+    _sig_list = list(mc["signals"].items())
+    _sig_cols = st.columns(4)
+    for _i, (_key, (_icon, _val, _desc)) in enumerate(_sig_list):
+        _bc = "#ef4444" if _icon=="🔴" else ("#f59e0b" if _icon=="🟡" else "#22c55e")
+        _sig_cols[_i % 4].markdown(f"""
+        <div style="background:#0d1321;border:1px solid {_bc}33;
+                    border-left:3px solid {_bc};border-radius:8px;
+                    padding:12px 14px;margin:4px 0;min-height:90px;">
+          <div style="font-size:9px;color:#475569;text-transform:uppercase;
+                      letter-spacing:0.8px;font-weight:600;">{_key}</div>
+          <div style="font-size:14px;font-weight:700;color:#f8fafc;margin:5px 0 4px;">{_icon} {_val}</div>
+          <div style="font-size:10px;color:#94a3b8;line-height:1.5;">{_desc}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── 重点关注指标清单 ─────────────────────────────────────────────────
+    if mc["watch_list"]:
+        st.markdown('<div class="section-title">📌 重点关注指标清单</div>', unsafe_allow_html=True)
+        st.caption("以下指标当前处于异常区域或触发预警阈值，建议重点跟踪并结合基本面研判")
+        _wl_cols = st.columns(2)
+        for _i, (_ind, _reason) in enumerate(mc["watch_list"]):
+            _wl_cols[_i % 2].markdown(
+                f'<div class="alert-card alert-yellow" style="margin:4px 0;">'
+                f'<div class="alert-title">📍 {_ind}</div>'
+                f'<div class="alert-desc">{_reason}</div></div>',
+                unsafe_allow_html=True
+            )
+        st.divider()
+
+    # ── 极端偏离指标 ─────────────────────────────────────────────────────
+    if mc["anomalies"]:
+        st.markdown('<div class="section-title">⚡ 极端偏离指标（|Z-Score| > 1.5σ）</div>',
+                    unsafe_allow_html=True)
+        st.caption("当前偏离历史均值最大的指标，可能预示趋势转折或存在均值回归机会")
+
+        _anom_rows = []
+        for _col_a, _zs_a, _val_a in mc["anomalies"]:
+            _anom_rows.append({
+                "指标":     _col_a,
+                "当前值":   f"{_val_a:.4g}",
+                "Z-Score":  f"{_zs_a:+.2f}σ",
+                "偏离方向": ("📈 极端偏高" if _zs_a > 2 else
+                             "⬆ 偏高"     if _zs_a > 1.5 else
+                             "📉 极端偏低" if _zs_a < -2 else "⬇ 偏低"),
+                "解读":     ("历史高位区间，关注均值回归压力" if _zs_a > 2 else
+                             "偏高区间，注意风险"           if _zs_a > 1.5 else
+                             "历史低位，关注反弹机会"        if _zs_a < -2 else
+                             "偏低区间，注意支撑"),
+            })
+        st.dataframe(pd.DataFrame(_anom_rows), use_container_width=True, hide_index=True)
+
+        # 偏离度条形图
+        _names_a = [r[0] for r in mc["anomalies"]]
+        _zs_a_v  = [r[1] for r in mc["anomalies"]]
+        _clrs_a  = ["#ef4444" if z > 0 else "#3b82f6" for z in _zs_a_v]
+        _fig_an = go.Figure(go.Bar(
+            y=_names_a, x=_zs_a_v, orientation="h",
+            marker_color=_clrs_a,
+            text=[f"{z:+.2f}σ" for z in _zs_a_v],
+            textposition="outside",
+            textfont=dict(size=10, color="#94a3b8"),
+        ))
+        for _lv, _lc in [(2,"#ef4444"),(1,"#f59e0b"),(-1,"#f59e0b"),(-2,"#ef4444")]:
+            _fig_an.add_vline(x=_lv, line_dash="dash", line_color=_lc, line_width=0.8)
+        _fig_an.add_vline(x=0, line_color="#374151", line_width=1)
+        _lo_an = mk_layout("极端偏离指标 Z-Score（红=偏高 蓝=偏低）",
+                           h=max(280, len(_names_a)*38), l=160, r=80, show_legend=False)
+        _lo_an["xaxis"]["range"] = [-4.5, 4.5]
+        _lo_an["xaxis"]["title"] = "Z-Score (σ)"
+        _fig_an.update_layout(**_lo_an)
+        st.plotly_chart(_fig_an, use_container_width=True)
+
+    st.divider()
+
+    # ── 综合结论 ─────────────────────────────────────────────────────────
+    st.markdown('<div class="section-title">📋 综合结论与操作参考</div>', unsafe_allow_html=True)
+    _red_sigs   = [(k, v[1]) for k, v in mc["signals"].items() if v[0] == "🔴"]
+    _yel_sigs   = [(k, v[1]) for k, v in mc["signals"].items() if v[0] == "🟡"]
+    _red_str    = "、".join([f"{k}（{v}）" for k, v in _red_sigs]) if _red_sigs else "暂无极端风险信号"
+    _yel_str    = "、".join([f"{k}（{v}）" for k, v in _yel_sigs]) if _yel_sigs else "无"
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0d1321,#111827);
+                border:1px solid #1e2a3a;border-radius:12px;padding:24px;margin:8px 0;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
+        <div>
+          <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:1px;">综合风险等级</div>
+          <div style="font-size:26px;font-weight:700;color:{_rs_color};margin-top:4px;">
+            {_rs}/11 · {_rs_label}
+          </div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:1px;">宏观情景</div>
+          <div style="font-size:16px;font-weight:600;color:{_reg_col};margin-top:4px;">{mc['regime']}</div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:#94a3b8;line-height:1.9;border-top:1px solid #1e2a3a;padding-top:14px;">
+        <div style="margin-bottom:8px;">
+          <span style="color:#f8fafc;font-weight:600;">📌 情景研判：</span>{mc['regime_desc']}
+        </div>
+        <div style="margin-bottom:8px;">
+          <span style="color:#ef4444;font-weight:600;">🔴 高风险信号：</span>{_red_str}
+        </div>
+        <div style="margin-bottom:8px;">
+          <span style="color:#f59e0b;font-weight:600;">🟡 需关注信号：</span>{_yel_str}
+        </div>
+        <div style="margin-bottom:8px;">
+          <span style="color:#f8fafc;font-weight:600;">💼 配置参考：</span>
+          {'、'.join([f"{a}（{s}）" for a, s in mc['regime_assets'].items()])}
+        </div>
+        <div style="padding-top:10px;border-top:1px solid #1e2a3a;font-size:10px;color:#374151;">
+          ⚠ 免责声明：本平台数据仅供学术研究参考，不构成任何投资建议。市场有风险，投资须谨慎。
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Footer — 数据源状态
 # ═══════════════════════════════════════════════════════════════════════════
 with st.expander("📡 数据源状态一览", expanded=False):
     ok_rows   = [{"指标": k, "状态": "✅ 正常"} for k, v in st_meta.items() if v == "ok"]
     fail_rows = [{"指标": k, "状态": "❌ 失败"} for k, v in st_meta.items() if v != "ok"]
-    mc1, mc2  = st.columns(2)
-    mc1.markdown(f"**✅ 正常 ({len(ok_rows)})**")
-    mc1.dataframe(pd.DataFrame(ok_rows), hide_index=True, use_container_width=True)
+    _fc1, _fc2  = st.columns(2)
+    _fc1.markdown(f"**✅ 正常 ({len(ok_rows)})**")
+    _fc1.dataframe(pd.DataFrame(ok_rows), hide_index=True, use_container_width=True)
     if fail_rows:
-        mc2.markdown(f"**❌ 失败 ({len(fail_rows)})**")
-        mc2.dataframe(pd.DataFrame(fail_rows), hide_index=True, use_container_width=True)
+        _fc2.markdown(f"**❌ 失败 ({len(fail_rows)})**")
+        _fc2.dataframe(pd.DataFrame(fail_rows), hide_index=True, use_container_width=True)
 
 st.markdown("""
 <div style='text-align:center;padding:16px 0 6px;font-size:11px;color:#1f2937;'>
-  宏观风险监控平台 v2.0 &nbsp;·&nbsp;
+  宏观风险监控平台 v3.0 &nbsp;·&nbsp;
   数据来源：yfinance · akshare · FRED &nbsp;·&nbsp;
   仅供研究参考，不构成任何投资建议
 </div>
