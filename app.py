@@ -849,6 +849,32 @@ def build_macro_regime(df_: pd.DataFrame, V_: dict, spread_102_) -> dict:
         else:
             signals["金融条件"] = ("🟢", f"NFCI={nfci:.3f}", "金融条件宽松：低于历史均值，有利于信贷扩张")
 
+    # ── 铜金比率（全球经济景气信号）──
+    cg_ratio = safe_val(df_, "铜金比率")
+    if cg_ratio is not None and "铜金比率" in df_.columns:
+        cg_s = df_["铜金比率"].dropna()
+        if len(cg_s) > 60:
+            cg_z = float(zscore(cg_s).iloc[-1])
+            if cg_z > 0.5:
+                signals["铜金比率"] = ("🟢", f"铜金={cg_ratio:.3f}", "铜金比率偏高：全球需求旺盛，周期性资产占优")
+            elif cg_z < -0.5:
+                signals["铜金比率"] = ("🔴", f"铜金={cg_ratio:.3f}", "铜金比率偏低：避险主导，全球增长预期走弱")
+                watch_list.append(("铜金比率", f"Z={cg_z:+.2f}σ，历史低位，全球需求不足信号"))
+            else:
+                signals["铜金比率"] = ("🟡", f"铜金={cg_ratio:.3f}", "铜金比率中性：经济景气度无明显方向")
+
+    # ── 10Y-3M利差（NY Fed衰退概率核心变量）──
+    sp10y3m = safe_val(df_, "10Y-3M利差")
+    if sp10y3m is not None:
+        _rp = recession_probability(sp10y3m)
+        if sp10y3m < -0.5:
+            signals["10Y-3M"] = ("🔴", f"={sp10y3m:+.2f}%", f"深度倒挂：NY Fed衰退概率约{_rp:.0f}%")
+            watch_list.append(("10Y-3M利差", f"倒挂{sp10y3m:+.2f}%，衰退概率{_rp:.0f}%"))
+        elif sp10y3m < 0:
+            signals["10Y-3M"] = ("🟡", f"={sp10y3m:+.2f}%", f"轻度倒挂：衰退概率{_rp:.0f}%，需持续跟踪")
+        else:
+            signals["10Y-3M"] = ("🟢", f"={sp10y3m:+.2f}%", f"曲线健康：衰退概率仅{_rp:.0f}%，10Y>3M")
+
     # ── 宏观情景四象限判断 ──
     growth_ok   = signals.get("就业",      ("🟢",))[0] == "🟢"
     infla_high  = signals.get("通胀",      ("🟢",))[0] in ("🔴", "🟡")
@@ -2075,38 +2101,106 @@ with tab6:
                  "高风险"   if _rs >= 7 else
                  "中等风险" if _rs >= 4 else "低风险")
 
+    # 信号计数（先于列块计算）
+    _n_red = sum(1 for v in mc["signals"].values() if v[0]=="🔴")
+    _n_yel = sum(1 for v in mc["signals"].values() if v[0]=="🟡")
+    _n_grn = sum(1 for v in mc["signals"].values() if v[0]=="🟢")
+    _pct_bar = min(100, _rs / 15 * 100)
+
     _col_r1, _col_r2, _col_r3 = st.columns([2, 1, 3])
     with _col_r1:
+        _wl_html = "".join([
+            f'<div style="font-size:11px;color:#94a3b8;margin-bottom:5px;">'
+            f'• <span style="color:#f8fafc;font-weight:600;">{wk[0]}</span>'
+            f'：{wk[1][:42]}{"\u2026" if len(wk[1])>42 else ""}</div>'
+            for wk in mc["watch_list"][:4]
+        ]) or '<div style="font-size:11px;color:#22c55e;">暂无触发预警的指标</div>'
         st.markdown(f"""
         <div style="background:linear-gradient(135deg,#0d1321,{_reg_col}18);
                     border:1px solid {_reg_col}55;border-radius:12px;padding:24px;">
           <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;font-weight:600;">当前宏观情景</div>
           <div style="font-size:22px;font-weight:700;color:{_reg_col};margin:10px 0 8px;">{mc['regime']}</div>
-          <div style="font-size:12px;color:#94a3b8;line-height:1.7;">{mc['regime_desc']}</div>
+          <div style="font-size:12px;color:#94a3b8;line-height:1.7;margin-bottom:14px;">{mc['regime_desc']}</div>
+          <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px;">
+            <span style="background:#ef444420;color:#ef4444;border:1px solid #ef444440;
+                         border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;">异常 {_n_red}</span>
+            <span style="background:#f59e0b20;color:#f59e0b;border:1px solid #f59e0b40;
+                         border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;">预警 {_n_yel}</span>
+            <span style="background:#22c55e20;color:#22c55e;border:1px solid #22c55e40;
+                         border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;">正常 {_n_grn}</span>
+          </div>
+          <div style="border-top:1px solid {_reg_col}30;padding-top:12px;">
+            <div style="font-size:10px;color:#475569;font-weight:600;letter-spacing:0.8px;
+                        text-transform:uppercase;margin-bottom:8px;">📌 当前预警项</div>
+            {_wl_html}
+          </div>
         </div>
         """, unsafe_allow_html=True)
     with _col_r2:
         st.markdown(f"""
         <div style="background:#0d1321;border:1px solid {_rs_color}55;border-radius:12px;
-                    padding:24px;text-align:center;height:100%;">
+                    padding:24px;text-align:center;">
           <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px;font-weight:600;">综合风险评分</div>
-          <div style="font-size:42px;font-weight:800;color:{_rs_color};margin:8px 0;">{_rs}</div>
-          <div style="font-size:13px;color:{_rs_color};font-weight:600;">/ 15 · {_rs_label}</div>
-          <div style="font-size:10px;color:#475569;margin-top:8px;line-height:1.5;">
-            通胀/就业/Sahm/曲线<br>信用/波动率/流动性/NFCI
+          <div style="font-size:48px;font-weight:800;color:{_rs_color};margin:8px 0 2px;line-height:1;">{_rs}</div>
+          <div style="font-size:13px;color:{_rs_color};font-weight:600;margin-bottom:14px;">/ 15 &nbsp;·&nbsp; {_rs_label}</div>
+          <div style="background:#1e2a3a;border-radius:6px;height:8px;overflow:hidden;margin-bottom:14px;">
+            <div style="background:linear-gradient(90deg,#22c55e 0%,#f59e0b 50%,#ef4444 100%);
+                        width:100%;height:100%;border-radius:6px;position:relative;">
+              <div style="position:absolute;right:{100-_pct_bar:.0f}%;top:0;bottom:0;right:0;
+                          background:#0d1321;transition:width 0.5s;
+                          width:{100-_pct_bar:.0f}%;"></div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:14px;">
+            <div style="background:#ef444415;border-radius:6px;padding:7px 2px;">
+              <div style="font-size:20px;font-weight:700;color:#ef4444;">{_n_red}</div>
+              <div style="font-size:9px;color:#475569;">异常</div>
+            </div>
+            <div style="background:#f59e0b15;border-radius:6px;padding:7px 2px;">
+              <div style="font-size:20px;font-weight:700;color:#f59e0b;">{_n_yel}</div>
+              <div style="font-size:9px;color:#475569;">预警</div>
+            </div>
+            <div style="background:#22c55e15;border-radius:6px;padding:7px 2px;">
+              <div style="font-size:20px;font-weight:700;color:#22c55e;">{_n_grn}</div>
+              <div style="font-size:9px;color:#475569;">正常</div>
+            </div>
+          </div>
+          <div style="font-size:9px;color:#475569;line-height:1.6;
+                      border-top:1px solid #1e2a3a;padding-top:10px;text-align:left;">
+            评分维度：通胀 / 就业 / Sahm / 曲线<br>
+            信用 / 波动率 / 流动性 / NFCI<br>
+            铜金比率 / 10Y-3M / 美元 / 中美利差
           </div>
         </div>
         """, unsafe_allow_html=True)
     with _col_r3:
-        st.markdown("**各类资产配置参考信号**")
-        _asset_rows = []
+        _rows_html = ""
         for _asset, _sig in mc["regime_assets"].items():
             _ac = ("#22c55e" if "超配" in _sig else
-                   "#ef4444" if any(x in _sig for x in ["低配","谨慎"]) else
-                   "#f59e0b")
-            _asset_rows.append({"资产类别": _asset, "配置信号": _sig, "颜色参考": _ac})
-        _df_a = pd.DataFrame(_asset_rows)[["资产类别","配置信号"]]
-        st.dataframe(_df_a, use_container_width=True, hide_index=True)
+                   "#ef4444" if any(x in _sig for x in ["低配","谨慎"]) else "#f59e0b")
+            _dot = ("●" )
+            _rows_html += (
+                f'<tr style="border-bottom:1px solid #1e2a3a;">'
+                f'<td style="padding:8px 14px;color:#94a3b8;font-size:12px;white-space:nowrap;">{_asset}</td>'
+                f'<td style="padding:8px 14px;">'
+                f'<span style="color:{_ac};font-size:12px;font-weight:600;">{_sig}</span>'
+                f'</td></tr>'
+            )
+        st.markdown(f"""
+        <div style="font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:0.8px;
+                    font-weight:600;margin-bottom:8px;">📊 各类资产配置参考信号</div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr style="background:#0d1321;">
+            <th style="padding:7px 14px;color:#374151;font-size:10px;text-align:left;
+                       text-transform:uppercase;letter-spacing:0.8px;font-weight:600;
+                       border-bottom:1px solid #1e2a3a;">资产类别</th>
+            <th style="padding:7px 14px;color:#374151;font-size:10px;text-align:left;
+                       text-transform:uppercase;letter-spacing:0.8px;font-weight:600;
+                       border-bottom:1px solid #1e2a3a;">配置信号</th>
+          </tr></thead>
+          <tbody>{_rows_html}</tbody>
+        </table>
+        """, unsafe_allow_html=True)
 
     st.divider()
 
