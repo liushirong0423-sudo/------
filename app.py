@@ -1171,7 +1171,7 @@ with tab1:
     r1 = st.columns(5)
     r1[0].markdown(kpi("纳斯达克100", V["纳斯达克100"], CHG["纳斯达克100"]),        unsafe_allow_html=True)
     r1[1].markdown(kpi("标普500",     V["标普500"],     CHG["标普500"]),            unsafe_allow_html=True)
-    r1[2].markdown(kpi("恒生指数",    V["恒生指数"],    CHG["恒生指数"]),           unsafe_allow_html=True)
+    r1[2].markdown(kpi("MSCI新兴市场", V["MSCI新兴市场"], CHG["MSCI新兴市场"]),      unsafe_allow_html=True)
     r1[3].markdown(kpi("沪深300",     V["沪深300"],     CHG["沪深300"]),            unsafe_allow_html=True)
     r1[4].markdown(kpi("VIX恐慌",     V["VIX"],         CHG["VIX"], fmt=""),        unsafe_allow_html=True)
 
@@ -1546,89 +1546,89 @@ with tab4:
                 unsafe_allow_html=True)
     st.caption("ERP = 盈利收益率 (100/PE) − 10Y国债收益率（%）。ERP↑ → 股票性价比提升")
 
-    etabs = st.tabs(["A股 ERP", "美股 ERP", "实际利率体系", "完整收益率曲线", "🌏 中美利差"])
+    etabs = st.tabs(["📈 美股/纳指 ERP", "📊 实际利率体系", "📉 完整收益率曲线", "🌏 中美利差"])
 
-    # A股 ERP
+    # ── 美股 & 纳指 ERP ──────────────────────────────────────────────
     with etabs[0]:
-        if "沪深300_PE" in df.columns and "中国10Y国债" in df.columns:
-            pe_s   = df["沪深300_PE"].dropna()
-            bond_s = df["中国10Y国债"].dropna()
-            idx    = pe_s.index.intersection(bond_s.index)
-            if len(idx) > 20:
-                erp_a  = (100 / pe_s.loc[idx]) - bond_s.loc[idx]
-                erp_a.name = "A股ERP"
-                cl, cr = st.columns([3, 1])
-                with cl:
-                    fig_ea = go.Figure()
-                    fig_ea.add_trace(go.Scatter(
-                        x=erp_a.index, y=erp_a.values, name="A股ERP",
-                        line=dict(color="#22c55e", width=2),
-                        fill="tozeroy", fillcolor="rgba(34,197,94,0.07)",
-                        hovertemplate="A股ERP: %{y:.2f}%<extra></extra>",
-                    ))
-                    add_bands(fig_ea, erp_a)
-                    fig_ea.update_layout(**mk_layout(
-                        "沪深300 ERP = (100/PE) − 中国10Y国债收益率", h=380))
-                    st.plotly_chart(fig_ea, use_container_width=True)
-                with cr:
-                    cur_erp = float(erp_a.iloc[-1])
-                    z_erp   = float(zscore(erp_a).iloc[-1])
-                    pct_erp = (erp_a < cur_erp).mean() * 100
-                    color_e = "#22c55e" if cur_erp > erp_a.mean() else "#ef4444"
-                    lbl_e   = "🟢 高吸引力" if z_erp > 0.5 else ("🔴 低吸引力" if z_erp < -0.5 else "➡️ 中性")
-                    st.markdown(f"""
-                    <div class="kpi-card" style="padding:20px;margin-top:20px;">
-                      <div class="kpi-label">A股 ERP 当前值</div>
-                      <div class="kpi-value" style="color:{color_e};">{cur_erp:.2f}%</div>
-                      <div class="kpi-label" style="margin-top:10px;">Z-Score</div>
-                      <div style="font-size:18px;font-weight:600;color:#f8fafc;">{z_erp:+.2f}σ</div>
-                      <div class="kpi-label" style="margin-top:10px;">历史分位数</div>
-                      <div style="font-size:16px;font-weight:600;color:#f8fafc;">{pct_erp:.1f}%</div>
-                      <div style="font-size:11px;color:#475569;margin-top:8px;">{lbl_e}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("沪深300 PE 与中国国债数据交集不足（需 >20 个公共日期），请刷新数据。")
-        else:
-            st.warning("缺少沪深300 PE 或中国10Y国债数据，akshare 加载中请稍候。")
-
-    # 美股 ERP
-    with etabs[1]:
         tnx_cur = safe_val(df, "10Y美债")
-        sp_pe   = None
-        # ^GSPC 不含 PE，改用主流 ETF 获取
+        sp_pe, ndx_pe = None, None
         try:
             import yfinance as yf
             for _tk in ["SPY", "IVV", "VOO"]:
                 try:
-                    _info = yf.Ticker(_tk).info
-                    _pe = _info.get("trailingPE") or _info.get("forwardPE")
+                    _pe = yf.Ticker(_tk).info.get("trailingPE") or yf.Ticker(_tk).info.get("forwardPE")
                     if _pe and 5 < float(_pe) < 200:
-                        sp_pe = float(_pe)
-                        break
+                        sp_pe = float(_pe); break
+                except Exception:
+                    continue
+            for _tk in ["QQQ", "QQQM"]:
+                try:
+                    _pe = yf.Ticker(_tk).info.get("trailingPE") or yf.Ticker(_tk).info.get("forwardPE")
+                    if _pe and 5 < float(_pe) < 300:
+                        ndx_pe = float(_pe); break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        if sp_pe and tnx_cur:
-            ey   = 100 / sp_pe
-            erp  = ey - tnx_cur
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("标普500 当前PE", f"{sp_pe:.1f}×")
-            c2.metric("盈利收益率 (EY)", f"{ey:.2f}%")
-            c3.metric("10Y美债收益率",   f"{tnx_cur:.2f}%")
-            c4.metric("美股实时 ERP",    f"{erp:.2f}%",
-                      delta=f"{'高于' if erp>0 else '低于'}无风险利率")
+        if tnx_cur and (sp_pe or ndx_pe):
+            # ── KPI 行 ──
+            _kpi_cols = st.columns(7)
+            _kpi_cols[0].metric("10Y美债", f"{tnx_cur:.2f}%")
+            if sp_pe:
+                sp_ey  = 100 / sp_pe
+                sp_erp = sp_ey - tnx_cur
+                _ec    = "normal" if sp_erp > 0 else "inverse"
+                _kpi_cols[1].metric("标普500 PE",  f"{sp_pe:.1f}×")
+                _kpi_cols[2].metric("标普500 盈利收益率", f"{sp_ey:.2f}%")
+                _kpi_cols[3].metric("标普500 ERP", f"{sp_erp:+.2f}%",
+                                    delta=f"{'高于' if sp_erp>0 else '低于'}无风险利率",
+                                    delta_color=_ec)
+            if ndx_pe:
+                ndx_ey  = 100 / ndx_pe
+                ndx_erp = ndx_ey - tnx_cur
+                _ec2    = "normal" if ndx_erp > 0 else "inverse"
+                _kpi_cols[4].metric("纳指100 PE",  f"{ndx_pe:.1f}×")
+                _kpi_cols[5].metric("纳指100 盈利收益率", f"{ndx_ey:.2f}%")
+                _kpi_cols[6].metric("纳指100 ERP", f"{ndx_erp:+.2f}%",
+                                    delta=f"{'高于' if ndx_erp>0 else '低于'}无风险利率",
+                                    delta_color=_ec2)
+
+            # ── 对比柱图 ──
+            _erp_items = {}
+            if sp_pe:  _erp_items["标普500 ERP"] = (100/sp_pe - tnx_cur, "#3b82f6")
+            if ndx_pe: _erp_items["纳指100 ERP"] = (100/ndx_pe - tnx_cur, "#a855f7")
+            if _erp_items:
+                _names = list(_erp_items.keys())
+                _vals  = [_erp_items[k][0] for k in _names]
+                _clrs  = ["#22c55e" if v > 0 else "#ef4444" for v in _vals]
+                fig_erp = go.Figure(go.Bar(
+                    x=_names, y=_vals,
+                    marker_color=_clrs,
+                    text=[f"{v:+.2f}%" for v in _vals],
+                    textposition="outside",
+                    textfont=dict(size=15, color="#f8fafc"),
+                    width=0.35,
+                ))
+                fig_erp.add_hline(y=0, line_color="#475569", line_width=1,
+                                  annotation_text="ERP=0 (股债无差异)",
+                                  annotation_font=dict(color="#6b7280", size=10))
+                lo_erp = mk_layout("股票风险溢价 ERP = 盈利收益率 (100/PE) − 10Y美债收益率",
+                                   h=340, show_legend=False)
+                lo_erp["yaxis"]["title"] = "ERP (%)"
+                fig_erp.update_layout(**lo_erp)
+                st.plotly_chart(fig_erp, use_container_width=True)
+
             st.caption(
-                "注：美股 PE 历史序列需要 Shiller CAPE 数据（FRED series: MKTGDP 或 Quandl MULTPL）。"
-                "当前展示实时 PE 估算值；如需历史 ERP 曲线，可接入 Shiller CAPE Excel 文件。"
+                "• **ERP > 0**：盈利收益率 > 无风险利率 → 股票相对债券有吸引力\n"
+                "• **ERP < 0**：持有国债回报更高 → 股票估值偏贵，注意回调风险\n"
+                "• 纳指100 PE 通常远高于标普500，ERP 更低，对利率上行更为敏感"
             )
         else:
-            st.info("标普500 PE 或10Y美债数据暂不可用，请稍后刷新。")
+            st.info("PE 或10Y美债数据暂不可用，请稍后刷新。")
 
     # 实际利率体系
-    with etabs[2]:
+    with etabs[1]:
         tips_cfg = {
             "TIPS_10Y实际利率": ("#3b82f6", "10Y TIPS实际利率"),
             "10Y盈亏平衡通胀":  ("#f59e0b", "10Y盈亏平衡通胀预期"),
@@ -1660,7 +1660,7 @@ with tab4:
             st.info("TIPS 实际利率数据加载中，请稍后刷新（FRED API）。")
 
     # 完整收益率曲线
-    with etabs[3]:
+    with etabs[2]:
         rate_nm = {"2Y":"2Y美债","5Y":"5Y美债","10Y":"10Y美债","30Y":"30Y美债"}
         avail_r = {k: v for k, v in rate_nm.items() if v in df.columns}
         if len(avail_r) >= 2:
@@ -1697,7 +1697,7 @@ with tab4:
                     st.plotly_chart(fig_snap, use_container_width=True)
 
     # ── 中美利差 ──────────────────────────────────────────────────────
-    with etabs[4]:
+    with etabs[3]:
         st.markdown('<div class="section-title">🌏 中美利差 & 全球国债比较</div>',
                     unsafe_allow_html=True)
         st.caption("中美利差 = 美国10Y − 中国10Y。利差为负表示资金倾向流向美国，人民币汇率承压；利差为正则反之。")
