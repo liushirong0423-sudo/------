@@ -351,6 +351,7 @@ def fetch_csi300(days: int) -> tuple:
         price = price[price.index >= cutoff]
 
         pe = pd.Series(dtype=float)
+        # ── 方法1: index_value_name_fundation（中证指数官网）──
         try:
             pe_df = ak.index_value_name_fundation(symbol="沪深300")
             if pe_df is not None and not pe_df.empty:
@@ -364,6 +365,35 @@ def fetch_csi300(days: int) -> tuple:
                     pe = pe[pe.index >= cutoff]
         except Exception:
             pass
+        # ── 方法2: stock_zh_index_value_csindex（中证官方接口）──
+        if pe.empty:
+            try:
+                pe_df2 = ak.stock_zh_index_value_csindex(symbol="000300")
+                if pe_df2 is not None and not pe_df2.empty:
+                    date_col = pe_df2.columns[0]
+                    pe_df2.index = pd.to_datetime(pe_df2[date_col])
+                    pe_col2 = next(
+                        (c for c in pe_df2.columns if "pe" in c.lower() or "市盈" in c), None
+                    )
+                    if pe_col2:
+                        pe = pd.to_numeric(pe_df2[pe_col2], errors="coerce").dropna()
+                        pe.name = "沪深300_PE"
+                        pe = pe[pe.index >= cutoff]
+            except Exception:
+                pass
+        # ── 方法3: index_analysis_cons_em（东方财富接口）──
+        if pe.empty:
+            try:
+                pe_df3 = ak.index_analysis_cons_em(symbol="沪深300", indicator="市盈率")
+                if pe_df3 is not None and not pe_df3.empty:
+                    date_col3 = pe_df3.columns[0]
+                    pe_df3.index = pd.to_datetime(pe_df3[date_col3])
+                    val_col3 = pe_df3.columns[-1]
+                    pe = pd.to_numeric(pe_df3[val_col3], errors="coerce").dropna()
+                    pe.name = "沪深300_PE"
+                    pe = pe[pe.index >= cutoff]
+            except Exception:
+                pass
         return price, pe
     except Exception:
         return pd.Series(dtype=float), pd.Series(dtype=float)
@@ -371,13 +401,26 @@ def fetch_csi300(days: int) -> tuple:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_hsi(days: int) -> pd.Series:
+    cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
+    # ── 优先使用 yfinance ^HSI（稳定可靠）──
+    try:
+        import yfinance as yf
+        raw = yf.download("^HSI", period="6y", progress=False, auto_adjust=True)
+        if raw is not None and not raw.empty:
+            s = raw["Close"].squeeze().dropna()
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            s.name = "恒生指数"
+            return s[s.index >= cutoff]
+    except Exception:
+        pass
+    # ── akshare 备用 ──
     try:
         import akshare as ak
         df = ak.stock_hk_index_daily_em(symbol="恒生指数")
         df.index = pd.to_datetime(df["date"])
         s = pd.to_numeric(df["close"], errors="coerce").dropna()
         s.name = "恒生指数"
-        return s[s.index >= pd.Timestamp(datetime.today() - timedelta(days=days + 10))]
+        return s[s.index >= cutoff]
     except Exception:
         return pd.Series(dtype=float)
 
@@ -1553,10 +1596,18 @@ with tab4:
     with etabs[1]:
         tnx_cur = safe_val(df, "10Y美债")
         sp_pe   = None
+        # ^GSPC 不含 PE，改用主流 ETF 获取
         try:
             import yfinance as yf
-            info = yf.Ticker("^GSPC").info
-            sp_pe = info.get("trailingPE") or info.get("forwardPE")
+            for _tk in ["SPY", "IVV", "VOO"]:
+                try:
+                    _info = yf.Ticker(_tk).info
+                    _pe = _info.get("trailingPE") or _info.get("forwardPE")
+                    if _pe and 5 < float(_pe) < 200:
+                        sp_pe = float(_pe)
+                        break
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -1753,27 +1804,49 @@ with tab5:
     with sub1:
         st.markdown('<div class="section-title">🔗 宏观指标相关性热力图</div>',
                     unsafe_allow_html=True)
-        heat_cols = [
-            c for c in df.columns
-            if not c.endswith("_PE")
-            and df[c].dropna().shape[0] > 60
+        # ── 先过滤出高频、有足够数据的序列 ──
+        df_ret_all = df.pct_change().dropna(how="all")
+        ret_density = df_ret_all.notna().mean()
+        hf_all = ret_density[ret_density > 0.10].index.tolist()
+        hf_all = [c for c in hf_all if not c.endswith("_PE")
+                  and df_ret_all[c].dropna().shape[0] > 60]
+
+        # ── 精选核心指标（默认显示，避免杂乱）──
+        CORE_HEAT = [
+            "纳斯达克100","标普500","道琼斯","MSCI新兴市场","德国DAX",
+            "沪深300","恒生指数","上证综指",
+            "10Y美债","2Y美债","VIX","SKEW指数","VVIX",
+            "美元指数","欧元/美元","美元/人民币",
+            "黄金","原油WTI","铜","铜金比率",
+            "美高收益债利差","TIPS_10Y实际利率",
+            "美联储储总资产",
         ]
+        default_sel = [c for c in CORE_HEAT if c in hf_all]
+        extra_opts  = [c for c in hf_all if c not in default_sel]
+
+        with st.expander("⚙️ 自定义指标选择", expanded=False):
+            sel_cols = st.multiselect(
+                "从所有高频指标中选择（建议 ≤30 个）",
+                options=hf_all,
+                default=default_sel,
+                key="corr_sel",
+            )
+        if not sel_cols:
+            sel_cols = default_sel
+
+        heat_cols = [c for c in sel_cols if c in df_ret_all.columns]
         if len(heat_cols) < 3:
-            st.warning("有效序列不足，请刷新后重试。")
+            st.warning("有效序列不足，请调整选择后重试。")
         else:
-            df_ret  = df[heat_cols].pct_change().dropna(how="all")
-            # ── 关键修复：过滤月度/低频FRED序列 ──────────────────────
-            # 月度数据（CPI、PMI、M2等）在日度DataFrame中密度仅约4-5%，
-            # 与日频数据混算会导致相关性严重失真（样本量不匹配）。
-            # 通过密度筛选确保只有日/周频数据参与相关性计算。
-            ret_density   = df_ret.notna().mean()
-            high_freq_cols = ret_density[ret_density > 0.10].index.tolist()
-            df_ret  = df_ret[high_freq_cols]
-            df_ret  = df_ret.dropna(axis=1, thresh=int(len(df_ret) * 0.4))
+            df_ret  = df_ret_all[heat_cols].dropna(axis=1, thresh=int(len(df_ret_all) * 0.4))
             heat_cols = list(df_ret.columns)
             corr    = df_ret.corr(method="pearson")
-            # 截断过长标签
-            labels  = [c[:9] if len(c) > 9 else c for c in corr.columns]
+            n       = len(heat_cols)
+            # 动态字号：指标越多字越小，超过30个隐藏数字
+            txt_size  = max(6, 11 - n // 5)
+            show_text = n <= 28
+            labels    = [c[:8] if len(c) > 8 else c for c in corr.columns]
+            chart_h   = max(500, min(900, 380 + n * 14))
 
             fig_hm = go.Figure(data=go.Heatmap(
                 z=corr.values,
@@ -1784,9 +1857,9 @@ with tab5:
                     [0.65, "#9f1239"],[1.0, "#dc2626"],
                 ],
                 zmin=-1, zmax=1,
-                text=np.round(corr.values, 2),
-                texttemplate="%{text}",
-                textfont=dict(size=9, color="#d1d5db"),
+                text=np.round(corr.values, 2) if show_text else None,
+                texttemplate="%{text}" if show_text else None,
+                textfont=dict(size=txt_size, color="#d1d5db") if show_text else None,
                 colorbar=dict(
                     title=dict(text="ρ", font=dict(color="#94a3b8", size=12)),
                     tickvals=[-1, -0.5, 0, 0.5, 1],
@@ -1801,14 +1874,14 @@ with tab5:
             fig_hm.update_layout(dict(
                 paper_bgcolor=BG_CARD, plot_bgcolor=BG,
                 font=dict(color=TEXT, family="Inter", size=10),
-                height=560,
-                margin=dict(l=80, r=60, t=44, b=80),
+                height=chart_h,
+                margin=dict(l=90, r=60, t=44, b=90),
                 title=dict(
-                    text=f"宏观指标日收益率相关性  |  {period_label}",
+                    text=f"宏观指标日收益率相关性  |  {period_label}  |  共 {n} 个指标",
                     font=dict(color="#94a3b8", size=13), x=0, xanchor="left",
                 ),
-                xaxis=dict(tickangle=-45, tickfont=dict(size=10)),
-                yaxis=dict(tickfont=dict(size=10)),
+                xaxis=dict(tickangle=-45, tickfont=dict(size=max(8, 11 - n // 6))),
+                yaxis=dict(tickfont=dict(size=max(8, 11 - n // 6))),
             ))
             st.plotly_chart(fig_hm, use_container_width=True)
 
