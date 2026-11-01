@@ -1,7 +1,23 @@
 """全局配置：FRED 序列、行情品种清单、时间周期与配色常量"""
+import os
+
 import streamlit as st
 
-FRED_API_KEY = st.secrets.get("FRED_API_KEY", "8923281d30974da13834d8350c0d9669")
+_DEFAULT_FRED_KEY = "8923281d30974da13834d8350c0d9669"
+
+
+def _resolve_fred_key() -> str:
+    """按 环境变量 → Streamlit secrets → 内置默认值 的顺序取 FRED Key。
+    云端（魔搭创空间）没有 secrets.toml 时，st.secrets 会抛异常，必须兜底。"""
+    if os.getenv("FRED_API_KEY"):
+        return os.environ["FRED_API_KEY"]
+    try:
+        return st.secrets.get("FRED_API_KEY", _DEFAULT_FRED_KEY)
+    except Exception:
+        return _DEFAULT_FRED_KEY
+
+
+FRED_API_KEY = _resolve_fred_key()
 
 YFINANCE_EQUITY = {
     "纳斯达克100": "^NDX",
