@@ -265,22 +265,54 @@ def _ak_yearly_series(df: pd.DataFrame, name: str, cutoff: pd.Timestamp) -> pd.S
     return s[s.index >= cutoff]
 
 
+def _cn_month_to_ts(v) -> pd.Timestamp:
+    """解析中文月度日期：'2026年10月份' 或 '202610' → Timestamp"""
+    s = str(v).strip()
+    m = re.match(r"(\d{4})\s*年\s*(\d{1,2})\s*月", s)
+    if m:
+        return pd.Timestamp(int(m.group(1)), int(m.group(2)), 1)
+    m = re.match(r"^(\d{4})[-/]?(\d{2})$", s)
+    if m:
+        return pd.Timestamp(int(m.group(1)), int(m.group(2)), 1)
+    return pd.NaT
+
+
+def _ak_monthly_series(df: pd.DataFrame, name: str, cutoff: pd.Timestamp, val_col: str) -> pd.Series:
+    """东方财富月度宏观表 → Series（'月份' 列为中文格式）"""
+    if df is None or df.empty or "月份" not in df.columns or val_col not in df.columns:
+        return pd.Series(dtype=float)
+    tmp = pd.DataFrame({
+        "d": df["月份"].map(_cn_month_to_ts),
+        "v": pd.to_numeric(df[val_col], errors="coerce"),
+    }).dropna()
+    if tmp.empty:
+        return pd.Series(dtype=float)
+    s = pd.Series(tmp["v"].values, index=pd.DatetimeIndex(tmp["d"]))
+    s = s[~s.index.duplicated(keep="first")].sort_index()
+    s.name = name
+    return s[s.index >= cutoff]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cn_macro(days: int) -> dict:
     result = {}
     cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
     try:
         import akshare as ak
-        # 中国CPI
+        # 中国CPI：东方财富月度（主，更新快且机房可达性好），金十（备）
         try:
-            s = _ak_yearly_series(ak.macro_china_cpi_yearly(), "中国CPI同比", cutoff)
+            s = _ak_monthly_series(ak.macro_china_cpi(), "中国CPI同比", cutoff, "全国-同比增长")
+            if s.empty:
+                s = _ak_yearly_series(ak.macro_china_cpi_yearly(), "中国CPI同比", cutoff)
             if not s.empty:
                 result["中国CPI同比"] = s
         except Exception:
             pass
-        # 中国PMI制造业
+        # 中国PMI制造业：东方财富月度（主），金十（备）
         try:
-            s = _ak_yearly_series(ak.macro_china_pmi_yearly(), "中国PMI制造业", cutoff)
+            s = _ak_monthly_series(ak.macro_china_pmi(), "中国PMI制造业", cutoff, "制造业-指数")
+            if s.empty:
+                s = _ak_yearly_series(ak.macro_china_pmi_yearly(), "中国PMI制造业", cutoff)
             if not s.empty:
                 result["中国PMI制造业"] = s
         except Exception:
@@ -326,37 +358,42 @@ def fetch_cn_macro_extended(days: int) -> dict:
     cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
     try:
         import akshare as ak
-        # 中国PPI同比
+        # 中国PPI同比：东方财富月度（主），金十（备）
         try:
-            s = _ak_yearly_series(ak.macro_china_ppi_yearly(), "中国PPI同比", cutoff)
+            s = _ak_monthly_series(ak.macro_china_ppi(), "中国PPI同比", cutoff, "当月同比增长")
+            if s.empty:
+                s = _ak_yearly_series(ak.macro_china_ppi_yearly(), "中国PPI同比", cutoff)
             if not s.empty:
                 result["中国PPI同比"] = s
         except Exception:
             pass
-        # 财新PMI制造业
+        # 财新PMI制造业（金十）
         try:
             s = _ak_yearly_series(ak.macro_china_cx_pmi_yearly(), "财新PMI制造业", cutoff)
             if not s.empty:
                 result["财新PMI制造业"] = s
         except Exception:
             pass
-        # 中国M2同比
+        # 中国M1/M2同比：东方财富货币供应（主），金十（备）
         try:
-            s = _ak_yearly_series(ak.macro_china_m2_yearly(), "中国M2同比", cutoff)
-            if not s.empty:
-                result["中国M2同比"] = s
+            _ms = ak.macro_china_money_supply()
+            s2 = _ak_monthly_series(_ms, "中国M2同比", cutoff, "货币和准货币(M2)-同比增长")
+            s1 = _ak_monthly_series(_ms, "中国M1同比", cutoff, "货币(M1)-同比增长")
+            if s2.empty:
+                s2 = _ak_yearly_series(ak.macro_china_m2_yearly(), "中国M2同比", cutoff)
+            if s1.empty:
+                s1 = _ak_yearly_series(ak.macro_china_m1_yearly(), "中国M1同比", cutoff)
+            if not s2.empty:
+                result["中国M2同比"] = s2
+            if not s1.empty:
+                result["中国M1同比"] = s1
         except Exception:
             pass
-        # 中国M1同比
+        # 社会融资规模增量：东方财富（主），金十（备）
         try:
-            s = _ak_yearly_series(ak.macro_china_m1_yearly(), "中国M1同比", cutoff)
-            if not s.empty:
-                result["中国M1同比"] = s
-        except Exception:
-            pass
-        # 社会融资规模增量
-        try:
-            s = _ak_yearly_series(ak.macro_china_sf_yearly(), "社会融资规模", cutoff)
+            s = _ak_monthly_series(ak.macro_china_shrzgm(), "社会融资规模", cutoff, "社会融资规模增量")
+            if s.empty:
+                s = _ak_yearly_series(ak.macro_china_sf_yearly(), "社会融资规模", cutoff)
             if not s.empty:
                 result["社会融资规模"] = s
         except Exception:
