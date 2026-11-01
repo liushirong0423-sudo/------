@@ -238,6 +238,33 @@ def fetch_hsi(days: int) -> pd.Series:
         return pd.Series(dtype=float)
 
 
+def _ak_yearly_series(df: pd.DataFrame, name: str, cutoff: pd.Timestamp) -> pd.Series:
+    """akshare 宏观年率表统一解析：列通常为 ['商品','日期','今值','预测值','前值']，
+    但部分接口列顺序不同，因此按列名优先、必要时逐列探测日期列，避免用错列。"""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    date_col = "日期" if "日期" in df.columns else None
+    if date_col is None:
+        for c in df.columns:
+            if pd.to_datetime(df[c], errors="coerce").notna().mean() > 0.8:
+                date_col = c
+                break
+    if date_col is None:
+        return pd.Series(dtype=float)
+    val_col = next((c for c in df.columns if "今值" in str(c)), None)
+    if val_col is None:
+        val_col = next((c for c in df.columns
+                        if c != date_col
+                        and pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.5), None)
+    if val_col is None:
+        return pd.Series(dtype=float)
+    idx = pd.to_datetime(df[date_col], errors="coerce")
+    s = pd.Series(pd.to_numeric(df[val_col], errors="coerce").values, index=idx).dropna()
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s.name = name
+    return s[s.index >= cutoff]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cn_macro(days: int) -> dict:
     result = {}
@@ -246,26 +273,16 @@ def fetch_cn_macro(days: int) -> dict:
         import akshare as ak
         # 中国CPI
         try:
-            cpi = ak.macro_china_cpi_yearly()
-            if cpi is not None and not cpi.empty:
-                cpi.index = pd.to_datetime(cpi.iloc[:, 0])
-                vc = next((c for c in cpi.columns if "今值" in c or c == cpi.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(cpi[vc], errors="coerce").dropna()
-                    s.name = "中国CPI同比"
-                    result["中国CPI同比"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_cpi_yearly(), "中国CPI同比", cutoff)
+            if not s.empty:
+                result["中国CPI同比"] = s
         except Exception:
             pass
         # 中国PMI制造业
         try:
-            pmi = ak.macro_china_pmi_yearly()
-            if pmi is not None and not pmi.empty:
-                pmi.index = pd.to_datetime(pmi.iloc[:, 0])
-                vc = next((c for c in pmi.columns if "今值" in c or c == pmi.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(pmi[vc], errors="coerce").dropna()
-                    s.name = "中国PMI制造业"
-                    result["中国PMI制造业"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_pmi_yearly(), "中国PMI制造业", cutoff)
+            if not s.empty:
+                result["中国PMI制造业"] = s
         except Exception:
             pass
     except Exception:
@@ -311,62 +328,37 @@ def fetch_cn_macro_extended(days: int) -> dict:
         import akshare as ak
         # 中国PPI同比
         try:
-            ppi = ak.macro_china_ppi_yearly()
-            if ppi is not None and not ppi.empty:
-                ppi.index = pd.to_datetime(ppi.iloc[:, 0])
-                vc = next((c for c in ppi.columns if "今值" in c or c == ppi.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(ppi[vc], errors="coerce").dropna()
-                    s.name = "中国PPI同比"
-                    result["中国PPI同比"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_ppi_yearly(), "中国PPI同比", cutoff)
+            if not s.empty:
+                result["中国PPI同比"] = s
         except Exception:
             pass
         # 财新PMI制造业
         try:
-            pmi_cx = ak.macro_china_caixin_pmi_yearly()
-            if pmi_cx is not None and not pmi_cx.empty:
-                pmi_cx.index = pd.to_datetime(pmi_cx.iloc[:, 0])
-                vc = next((c for c in pmi_cx.columns if "今值" in c or c == pmi_cx.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(pmi_cx[vc], errors="coerce").dropna()
-                    s.name = "财新PMI制造业"
-                    result["财新PMI制造业"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_cx_pmi_yearly(), "财新PMI制造业", cutoff)
+            if not s.empty:
+                result["财新PMI制造业"] = s
         except Exception:
             pass
         # 中国M2同比
         try:
-            m2 = ak.macro_china_m2_yearly()
-            if m2 is not None and not m2.empty:
-                m2.index = pd.to_datetime(m2.iloc[:, 0])
-                vc = next((c for c in m2.columns if "今值" in c or c == m2.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(m2[vc], errors="coerce").dropna()
-                    s.name = "中国M2同比"
-                    result["中国M2同比"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_m2_yearly(), "中国M2同比", cutoff)
+            if not s.empty:
+                result["中国M2同比"] = s
         except Exception:
             pass
         # 中国M1同比
         try:
-            m1 = ak.macro_china_m1_yearly()
-            if m1 is not None and not m1.empty:
-                m1.index = pd.to_datetime(m1.iloc[:, 0])
-                vc = next((c for c in m1.columns if "今值" in c or c == m1.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(m1[vc], errors="coerce").dropna()
-                    s.name = "中国M1同比"
-                    result["中国M1同比"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_m1_yearly(), "中国M1同比", cutoff)
+            if not s.empty:
+                result["中国M1同比"] = s
         except Exception:
             pass
         # 社会融资规模增量
         try:
-            sf = ak.macro_china_sf_yearly()
-            if sf is not None and not sf.empty:
-                sf.index = pd.to_datetime(sf.iloc[:, 0])
-                vc = next((c for c in sf.columns if "今值" in c or c == sf.columns[1]), None)
-                if vc:
-                    s = pd.to_numeric(sf[vc], errors="coerce").dropna()
-                    s.name = "社会融资规模"
-                    result["社会融资规模"] = s[s.index >= cutoff]
+            s = _ak_yearly_series(ak.macro_china_sf_yearly(), "社会融资规模", cutoff)
+            if not s.empty:
+                result["社会融资规模"] = s
         except Exception:
             pass
     except Exception:
