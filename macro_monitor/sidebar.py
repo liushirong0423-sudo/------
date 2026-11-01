@@ -5,7 +5,7 @@ import streamlit as st
 
 from .config import (
     PERIOD_MAP, YFINANCE_COMMODITY, YFINANCE_EQUITY, YFINANCE_FX,
-    YFINANCE_RATES, YFINANCE_VOLATILITY,
+    YFINANCE_RATES,
 )
 
 
@@ -36,7 +36,6 @@ def render_sidebar():
         ["VIX"] +
         list(YFINANCE_FX.keys()) +
         list(YFINANCE_COMMODITY.keys()) +
-        list(YFINANCE_VOLATILITY.keys()) +
         ["中国10Y国债","沪深300","恒生指数","上证综指","创业板指","中证500","科创50",
          "美联储净流动性","美国CPI同比","美高收益债利差","TIPS_10Y实际利率",
          "M2货币供应","中美利差(10Y)","联邦基金利率",

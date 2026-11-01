@@ -27,9 +27,9 @@ def render(df, period_label):
         CORE_HEAT = [
             "纳斯达克100","标普500","道琼斯","MSCI新兴市场","德国DAX",
             "沪深300","恒生指数","上证综指",
-            "10Y美债","2Y美债","VIX","SKEW指数","VVIX",
+            "10Y美债","2Y美债","VIX",
             "美元指数","欧元/美元","美元/人民币",
-            "黄金","原油WTI","铜","铜金比率",
+            "黄金","原油WTI","铜","铜金比率","金银比率",
             "美高收益债利差","TIPS_10Y实际利率",
             "美联储储总资产",
         ]
@@ -137,8 +137,9 @@ def render(df, period_label):
             ("核心PCE同比",    "#f97316",  "核心PCE (%)",   2,   "2%目标"),
             ("美国失业率",     "#3b82f6",  "失业率 (%)",    4,   "4%参考"),
             ("密歇根消费信心", "#22c55e",  "消费信心指数",  None, None),
+            ("M1货币供应",     "#06b6d4",  "M1 (十亿美元)", None, None),
             ("M2货币供应",     "#a855f7",  "M2 (十亿美元)", None, None),
-            ("美投资级债利差", "#06b6d4",  "IG利差 (bps)",  None, None),
+            ("美投资级债利差", "#14b8a6",  "IG利差 (bps)",  None, None),
         ]
         avail_m = [(k, c, l, thr, tl) for k, c, l, thr, tl in macro_us if k in df.columns]
         if avail_m:
@@ -174,7 +175,8 @@ def render(df, period_label):
 
         # 中国宏观
         cn_m_cols = [c for c in [
-            "中国CPI同比","中国PPI同比","中国PMI制造业","财新PMI制造业","中国M2同比"
+            "中国CPI同比","中国PPI同比","中国PMI制造业","财新PMI制造业",
+            "中国M1同比","中国M2同比","M1-M2剪刀差","社会融资规模"
         ] if c in df.columns]
         if cn_m_cols:
             st.markdown('<div class="section-title">🇨🇳 中国宏观经济指标（akshare）</div>',

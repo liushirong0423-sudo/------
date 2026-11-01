@@ -214,33 +214,6 @@ def render(df, period_label):
             else:
                 st.info("金融压力指数加载中（FRED: STLFSI4）")
 
-        # VVIX & SKEW
-        _vv_avail = [c for c in ["VVIX", "SKEW指数"] if c in df.columns]
-        if _vv_avail:
-            st.markdown('<div class="section-title">🎲 波动率市场结构 (VVIX / SKEW 指数)</div>',
-                        unsafe_allow_html=True)
-            _fig_vv = go.Figure()
-            for _i, _cnm in enumerate(_vv_avail):
-                _sv = df[_cnm].dropna()
-                if _sv.empty:
-                    continue
-                _fig_vv.add_trace(go.Scatter(
-                    x=_sv.index, y=zscore(_sv).values,
-                    name=_cnm, line=dict(color=COLORS[_i], width=1.8),
-                ))
-            _fig_vv.add_hline(y=0, line_color="#374151", line_width=1)
-            for _lv, _lc in [(2, "#ef4444"), (1, "#f59e0b"), (-1, "#f59e0b"), (-2, "#ef4444")]:
-                _fig_vv.add_hline(y=_lv, line_dash="dash", line_color=_lc, line_width=0.7)
-            _fig_vv.update_layout(**mk_layout(
-                "VVIX（VIX的波动率）& SKEW指数 — Z-Score 标准化", h=300))
-            st.plotly_chart(_fig_vv, use_container_width=True)
-            st.caption(
-                "• **VVIX↑** → VIX本身的波动加剧，市场对短期尾部风险定价的不确定性上升，"
-                "历史上往往出现在市场转折前\n"
-                "• **SKEW↑** → 市场购买更多下行保险（OTM Put），隐含尾部事件预期上升；"
-                "SKEW > 140 通常预警黑天鹅事件担忧"
-            )
-
         # 工业生产指数
         if "工业生产指数" in df.columns:
             st.markdown('<div class="section-title">🏭 工业生产指数（经济周期同步指标）</div>',
@@ -330,7 +303,7 @@ def render(df, period_label):
         st.divider()
 
         # 全球大宗商品价格基准化对比
-        _comm_sel = [c for c in ["布伦特原油", "原油WTI", "铜", "黄金", "小麦", "玉米", "白银"]
+        _comm_sel = [c for c in ["布伦特原油", "原油WTI", "铜", "黄金", "白银", "天然气"]
                      if c in df.columns]
         if len(_comm_sel) >= 2:
             st.markdown('<div class="section-title">🌾 全球大宗商品价格（基准化=100）</div>',
@@ -352,9 +325,9 @@ def render(df, period_label):
                 f"大宗商品价格对比（起点=100，{period_label}）", h=380))
             st.plotly_chart(_fig_comm, use_container_width=True)
             st.caption(
-                "• **小麦/玉米↑** → 粮食通胀压力上升，对新兴市场影响尤大\n"
-                "• **布伦特/WTI↑** → 输入型通胀，压缩企业利润率，打压消费信心\n"
-                "• **铜与原油同向上涨** → 需求驱动的大宗商品牛市，经济扩张信号"
+                "• **原油↑** → 输入型通胀，压缩企业利润率，打压消费信心\n"
+                "• **铜与原油同向上涨** → 需求驱动的大宗商品牛市，经济扩张信号\n"
+                "• **金银比↑** → 避险情绪占优，白银工业属性被压制；反之则复苏预期升温"
             )
 
         # 建筑许可（房地产领先指标）

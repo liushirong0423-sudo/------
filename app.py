@@ -34,7 +34,7 @@ from macro_monitor.theme import apply_theme
 from macro_monitor.data_sources import load_all
 from macro_monitor.sidebar import render_sidebar
 from macro_monitor.views import (
-    canvas, dashboard, deep_analysis, diagnosis, early_warning, erp, markets,
+    canvas, dashboard, deep_analysis, diagnosis, early_warning, erp, markets, overview,
 )
 
 apply_theme()
@@ -84,9 +84,28 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 7 个主 Tab
+# 预计算核心指标值（供整体研判 Tab 使用）
 # ═══════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+from macro_monitor.analytics import safe_val
+
+_V_keys = [
+    "纳斯达克100", "标普500", "MSCI新兴市场", "VIX", "10Y美债", "2Y美债",
+    "美元指数", "黄金", "原油WTI", "中国10Y国债",
+    "沪深300", "上证综指", "创业板指", "美联储净流动性", "美高收益债利差",
+    "TIPS_10Y实际利率", "美国CPI同比", "美国失业率", "中美利差(10Y)",
+    "联邦基金利率",
+]
+V_pre = {k: safe_val(df, k) for k in _V_keys}
+spread_10_2_pre = (
+    V_pre["10Y美债"] - V_pre["2Y美债"]
+    if V_pre["10Y美债"] and V_pre["2Y美债"] else None
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8 个主 Tab
+# ═══════════════════════════════════════════════════════════════════════════
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "🧭 整体研判",
     "🎯 风险仪表盘",
     "🌍 全球市场",
     "🔬 万能画布",
@@ -95,6 +114,9 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🧠 综合诊断",
     "🔮 早期预警雷达",
 ])
+
+with tab0:
+    overview.render(df, V_pre, spread_10_2_pre)
 
 with tab1:
     V, CHG, spread_10_2 = dashboard.render(df)

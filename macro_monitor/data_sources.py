@@ -1,30 +1,48 @@
 """数据获取层：yfinance（海外行情）/ FRED（美国宏观）/ akshare（中国数据）"""
 import json
+import os
 import re
-import time
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
 
-from .config import ALL_YFINANCE, FRED_API_KEY, FRED_SERIES
+from .config import ALL_YFINANCE, FRED_API_KEY, FRED_SERIES, FRED_YOY_SERIES
+
+# 修复 yfinance SQLite 缓存目录问题（Windows 下默认缓存路径可能不可写）
+os.environ.setdefault("YF_CACHE_DIR", os.path.join(tempfile.gettempdir(), "yf_cache"))
+os.makedirs(os.environ["YF_CACHE_DIR"], exist_ok=True)
 
 def fetch_yf_batch(days: int) -> dict:
-    """批量拉取 yfinance 数据；被 Yahoo 限流返回空表时交由降级数据源处理"""
+    """批量拉取 yfinance 数据；被 Yahoo 限流返回空表时交由降级数据源处理。
+    使用线程 + 硬超时（20s）避免 Yahoo 限流时长时间挂起。"""
     try:
         import yfinance as yf
+        # 修复 Windows 下 yfinance SQLite 时区缓存不可写的问题
+        try:
+            yf.set_tz_cache_location(os.environ["YF_CACHE_DIR"])
+        except Exception:
+            pass
     except ImportError:
         return {}
 
     end   = datetime.today()
     start = end - timedelta(days=days + 10)
     result = {}
+    tickers_str = " ".join(ALL_YFINANCE.values())
+
+    def _download():
+        return yf.download(tickers_str, start=start, end=end,
+                           auto_adjust=True, progress=False, group_by="ticker",
+                           threads=True)
 
     try:
-        tickers_str = " ".join(ALL_YFINANCE.values())
-        raw = yf.download(tickers_str, start=start, end=end,
-                          auto_adjust=True, progress=False, group_by="ticker")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_download)
+            raw = fut.result(timeout=20)
         for name, ticker in ALL_YFINANCE.items():
             try:
                 if isinstance(raw.columns, pd.MultiIndex):
@@ -66,19 +84,49 @@ def fetch_fred_one(series_id: str, days: int) -> pd.Series:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fred_all(days: int) -> dict:
+    """并行拉取所有 FRED 序列；指数类序列自动转为同比%"""
     result = {}
-    for name, sid in FRED_SERIES.items():
+
+    def _fetch_one(item):
+        name, sid = item
         s = fetch_fred_one(sid, days)
         if not s.empty:
-            s.name   = name
-            result[name] = s
+            # FRED 月频指数 → 同比百分比变化
+            if name in FRED_YOY_SERIES:
+                s = (s.pct_change(periods=12) * 100).dropna()
+            s.name = name
+            return name, s
+        return name, None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for name, s in pool.map(_fetch_one, FRED_SERIES.items()):
+            if s is not None:
+                result[name] = s
     return result
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cn_bond(days: int) -> pd.Series:
+    """中国10Y国债收益率：优先用中债收益率曲线（快），备用中美债券对比（慢）"""
+    cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
     try:
         import akshare as ak
+        # 方法1：中债国债收益率曲线（快，~10s）
+        try:
+            end   = datetime.today().strftime("%Y%m%d")
+            start = (datetime.today() - timedelta(days=min(days + 10, 350))).strftime("%Y%m%d")
+            df = ak.bond_china_yield(start_date=start, end_date=end)
+            if df is not None and not df.empty:
+                gdf = df[df["曲线名称"].str.contains("国债", na=False)].copy()
+                if not gdf.empty and "10年" in gdf.columns:
+                    gdf.index = pd.to_datetime(gdf["日期"])
+                    s = pd.to_numeric(gdf["10年"], errors="coerce").dropna()
+                    s.name = "中国10Y国债"
+                    s = s[~s.index.duplicated(keep="last")].sort_index()
+                    return s[s.index >= cutoff]
+        except Exception:
+            pass
+        # 方法2：中美债券收益率对比（慢，备用）
         df = ak.bond_zh_us_rate(start_date="20150101")
         col = next((c for c in df.columns if "中国" in c and "10" in c), None)
         if col is None:
@@ -89,7 +137,7 @@ def fetch_cn_bond(days: int) -> pd.Series:
         df.index = pd.to_datetime(df[date_col])
         s = pd.to_numeric(df[col], errors="coerce").dropna()
         s.name = "中国10Y国债"
-        return s[s.index >= pd.Timestamp(datetime.today() - timedelta(days=days + 10))]
+        return s[s.index >= cutoff]
     except Exception:
         return pd.Series(dtype=float)
 
@@ -256,7 +304,7 @@ def fetch_cn_indices(days: int) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cn_macro_extended(days: int) -> dict:
-    """获取中国扩展宏观数据：PPI、财新PMI、M2同比"""
+    """获取中国扩展宏观数据：PPI、财新PMI、M2同比、M1同比、社融"""
     result = {}
     cutoff = pd.Timestamp(datetime.today() - timedelta(days=days + 10))
     try:
@@ -297,6 +345,30 @@ def fetch_cn_macro_extended(days: int) -> dict:
                     result["中国M2同比"] = s[s.index >= cutoff]
         except Exception:
             pass
+        # 中国M1同比
+        try:
+            m1 = ak.macro_china_m1_yearly()
+            if m1 is not None and not m1.empty:
+                m1.index = pd.to_datetime(m1.iloc[:, 0])
+                vc = next((c for c in m1.columns if "今值" in c or c == m1.columns[1]), None)
+                if vc:
+                    s = pd.to_numeric(m1[vc], errors="coerce").dropna()
+                    s.name = "中国M1同比"
+                    result["中国M1同比"] = s[s.index >= cutoff]
+        except Exception:
+            pass
+        # 社会融资规模增量
+        try:
+            sf = ak.macro_china_sf_yearly()
+            if sf is not None and not sf.empty:
+                sf.index = pd.to_datetime(sf.iloc[:, 0])
+                vc = next((c for c in sf.columns if "今值" in c or c == sf.columns[1]), None)
+                if vc:
+                    s = pd.to_numeric(sf[vc], errors="coerce").dropna()
+                    s.name = "社会融资规模"
+                    result["社会融资规模"] = s[s.index >= cutoff]
+        except Exception:
+            pass
     except Exception:
         pass
     return result
@@ -325,7 +397,7 @@ EM_SECID = {
     "恒生指数":   "100.HSI",    "美元指数": "100.UDI",
     "黄金":       "101.GC00Y",  "铜": "101.HG00Y",      "白银": "101.SI00Y",
     "原油WTI":    "102.CL00Y",  "天然气": "102.NG00Y",
-    "小麦":       "103.ZW00Y",  "玉米": "103.ZC00Y",    "美元/人民币": "133.USDCNH",
+    "美元/人民币": "133.USDCNH",
 }
 
 FRED_FALLBACK = {
@@ -372,23 +444,26 @@ def fetch_sina_one(name: str, days: int) -> pd.Series:
 
 
 def fetch_sina_fallback(names, days: int) -> dict:
-    """对 yfinance 缺失的品种逐个走新浪"""
+    """对 yfinance 缺失的品种并行走新浪"""
     out = {}
-    for nm in names:
+    def _one(nm):
         s = fetch_sina_one(nm, days)
-        if not s.empty:
-            s.name = nm
-            out[nm] = s
+        return nm, s if not s.empty else None
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for nm, s in pool.map(_one, names):
+            if s is not None:
+                s.name = nm
+                out[nm] = s
     return out
 
 
 def fetch_dxy_from_fred(days: int) -> pd.Series:
-    """用 FRED 汇率按 ICE 权重合成美元指数 DXY"""
+    """用 FRED 汇率按 ICE 权重合成美元指数 DXY（并行拉取）"""
     comps = {}
-    for sid in FRED_DXY_COMPONENTS:
-        s = fetch_fred_one(sid, days)
-        if not s.empty:
-            comps[sid] = s
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for sid, s in pool.map(lambda sid: (sid, fetch_fred_one(sid, days)), FRED_DXY_COMPONENTS):
+            if not s.empty:
+                comps[sid] = s
     if len(comps) < len(FRED_DXY_COMPONENTS):
         return pd.Series(dtype=float)
     d = pd.concat(comps, axis=1, join="inner").dropna()
@@ -414,7 +489,7 @@ def fetch_em_one(secid: str, days: int) -> pd.Series:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Referer": "https://quote.eastmoney.com/",
             },
-            timeout=15,
+            timeout=12,
         )
         klines = r.json()["data"]["klines"]
     except Exception:
@@ -429,31 +504,36 @@ def fetch_em_one(secid: str, days: int) -> pd.Series:
 
 
 def fetch_em_fallback(names, days: int) -> dict:
-    """对 yfinance 缺失的品种逐个走东方财富（限速 0.3s/次）"""
+    """对 yfinance 缺失的品种并行走东方财富（限并发避免被限流）"""
     out = {}
-    for nm in names:
+    def _one(nm):
         secid = EM_SECID.get(nm)
         if not secid:
-            continue
+            return nm, None
         s = fetch_em_one(secid, days)
-        if not s.empty:
-            s.name = nm
-            out[nm] = s
-        time.sleep(0.3)
+        return nm, s if not s.empty else None
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for nm, s in pool.map(_one, names):
+            if s is not None:
+                s.name = nm
+                out[nm] = s
     return out
 
 
 def fetch_fred_fallback(names, days: int) -> dict:
-    """东方财富也拿不到时，用 FRED 日频序列兜底"""
+    """东方财富也拿不到时，用 FRED 日频序列兜底（并行）"""
     out = {}
-    for nm in names:
+    def _one(nm):
         sid = FRED_FALLBACK.get(nm)
         if not sid:
-            continue
+            return nm, None
         s = fetch_fred_one(sid, days)
-        if not s.empty:
-            s.name = nm
-            out[nm] = s
+        return nm, s if not s.empty else None
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for nm, s in pool.map(_one, names):
+            if s is not None:
+                s.name = nm
+                out[nm] = s
     return out
 
 
@@ -477,10 +557,12 @@ def load_all(days: int):
         data[nm]   = s
         status[nm] = "ok"
 
-    # 美联储净流动性
-    walcl = fetch_fred_one("WALCL",     days)
-    tga   = fetch_fred_one("WTREGEN",   days)
-    rrp   = fetch_fred_one("RRPONTSYD", days)
+    # 美联储净流动性（并行拉取 WALCL / TGA / RRP）
+    with ThreadPoolExecutor(max_workers=3) as _pool:
+        _f_walcl = _pool.submit(fetch_fred_one, "WALCL", days)
+        _f_tga   = _pool.submit(fetch_fred_one, "WTREGEN", days)
+        _f_rrp   = _pool.submit(fetch_fred_one, "RRPONTSYD", days)
+        walcl, tga, rrp = _f_walcl.result(), _f_tga.result(), _f_rrp.result()
     if not walcl.empty:
         tmp = pd.concat([walcl, tga, rrp], axis=1, join="outer")
         tmp.columns = ["WALCL", "TGA", "RRP"]
@@ -490,18 +572,41 @@ def load_all(days: int):
         data["美联储净流动性"]   = net.dropna()
         status["美联储净流动性"] = "ok"
 
-    # akshare 中国数据
-    for nm, s in [
-        ("中国10Y国债", fetch_cn_bond(days)),
-        ("恒生指数",    fetch_hsi(days)),
-    ]:
+    # akshare 中国数据（并行拉取：国债、恒指、沪深300、宏观、A股指数、扩展宏观）
+    # 每个调用设置 25s 硬超时，避免 akshare 内部 HTTP 请求无超时导致整体挂起
+    _CN_TIMEOUT = 25
+    def _safe(fn, *args, **kwargs):
+        _p = ThreadPoolExecutor(max_workers=1)
+        try:
+            return _p.submit(fn, *args, **kwargs).result(timeout=_CN_TIMEOUT)
+        except Exception:
+            if fn is fetch_csi300:
+                return pd.Series(dtype=float), pd.Series(dtype=float)
+            return {} if fn in (fetch_cn_macro, fetch_cn_indices, fetch_cn_macro_extended) else pd.Series(dtype=float)
+        finally:
+            _p.shutdown(wait=False)  # 不等待可能挂起的线程
+
+    with ThreadPoolExecutor(max_workers=6) as _pool:
+        _f_bond  = _pool.submit(_safe, fetch_cn_bond, days)
+        _f_hsi   = _pool.submit(_safe, fetch_hsi, days)
+        _f_csi   = _pool.submit(_safe, fetch_csi300, days)
+        _f_macro = _pool.submit(_safe, fetch_cn_macro, days)
+        _f_idx   = _pool.submit(_safe, fetch_cn_indices, days)
+        _f_ext   = _pool.submit(_safe, fetch_cn_macro_extended, days)
+        cn_bond_s  = _f_bond.result()
+        hsi_s      = _f_hsi.result()
+        csi_price, csi_pe = _f_csi.result()
+        cn_macro_d = _f_macro.result()
+        cn_idx_d   = _f_idx.result()
+        cn_ext_d   = _f_ext.result()
+
+    for nm, s in [("中国10Y国债", cn_bond_s), ("恒生指数", hsi_s)]:
         if not s.empty:
             data[nm]   = s
             status[nm] = "ok"
         else:
             status[nm] = "failed"
 
-    csi_price, csi_pe = fetch_csi300(days)
     if not csi_price.empty:
         data["沪深300"]   = csi_price
         status["沪深300"] = "ok"
@@ -509,17 +614,17 @@ def load_all(days: int):
         data["沪深300_PE"]   = csi_pe
         status["沪深300_PE"] = "ok"
 
-    for nm, s in fetch_cn_macro(days).items():
+    for nm, s in cn_macro_d.items():
         data[nm]   = s
         status[nm] = "ok"
 
     # 中国A股主要指数
-    for nm, s in fetch_cn_indices(days).items():
+    for nm, s in cn_idx_d.items():
         data[nm]   = s
         status[nm] = "ok"
 
     # 中国扩展宏观数据（PPI、财新PMI、M2同比）
-    for nm, s in fetch_cn_macro_extended(days).items():
+    for nm, s in cn_ext_d.items():
         data[nm]   = s
         status[nm] = "ok"
 
@@ -564,6 +669,37 @@ def load_all(days: int):
             _ca.name = "铜金比率"
             data["铜金比率"]   = _ca
             status["铜金比率"] = "ok"
+
+    # 金银比率（黄金/白银：上升=避险情绪浓，白银工业属性被压制；下降=经济复苏预期）
+    _ag = data.get("白银")
+    if _ag is not None and _au is not None:
+        _idx_ag = _au.index.intersection(_ag.index)
+        if len(_idx_ag) > 20:
+            _gsr = (_au.loc[_idx_ag] / _ag.loc[_idx_ag]).dropna()
+            _gsr.name = "金银比率"
+            data["金银比率"]   = _gsr
+            status["金银比率"] = "ok"
+
+    # 油金比率（原油/黄金：反映通胀预期 vs 避险；极端高位=通胀过热/供给冲击）
+    _oil = data.get("原油WTI")
+    if _oil is not None and _au is not None:
+        _idx_oil = _oil.index.intersection(_au.index)
+        if len(_idx_oil) > 20:
+            _ogr = (_oil.loc[_idx_oil] / _au.loc[_idx_oil] * 100).dropna()
+            _ogr.name = "油金比率"
+            data["油金比率"]   = _ogr
+            status["油金比率"] = "ok"
+
+    # M1-M2 剪刀差（M1同比 − M2同比：正值=企业活期活跃、经济活力强；负值=资金定期化、需求偏弱）
+    _m1 = data.get("中国M1同比")
+    _m2 = data.get("中国M2同比")
+    if _m1 is not None and _m2 is not None:
+        _idx_m = _m1.index.intersection(_m2.index)
+        if len(_idx_m) > 10:
+            _scissors = (_m1.loc[_idx_m] - _m2.loc[_idx_m]).dropna()
+            _scissors.name = "M1-M2剪刀差"
+            data["M1-M2剪刀差"]   = _scissors
+            status["M1-M2剪刀差"] = "ok"
 
     # Sahm规则指标（月频失业率衍生，≥0.5pp自动触发衰退信号）
     _ur = data.get("美国失业率")
