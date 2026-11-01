@@ -1,3 +1,14 @@
+---
+title: 全维度宏观风险监控平台
+emoji: 📡
+colorFrom: blue
+colorTo: indigo
+sdk: streamlit
+app_file: app.py
+pinned: false
+license: apache-2.0
+---
+
 # 📡 全维度宏观风险监控平台 v4.0
 
 基于 **Python + Streamlit** 构建的零成本全维度宏观风险监控工具，采用 Bloomberg 深色终端风格 UI，实时聚合美股、港股、A 股、大宗商品、利率及 FRED 宏观经济数据。
@@ -6,10 +17,11 @@
 
 ---
 
-## 功能概览（7 个标签页）
+## 功能概览（8 个标签页）
 
 | 模块 | 内容 |
 |------|------|
+| 🧭 整体研判 | 当前经济环境、资产估值状态、适合投资的资产及理由、一句话结论 |
 | 🎯 风险仪表盘 | 三级警报系统（VIX / 利差倒挂 / 美元 / 信用利差）、核心 KPI 卡片、美联储净流动性（WALCL−TGA−RRP） |
 | 🌍 全球市场 | 全球股指基准化对比、大宗商品（黄金/原油/铜/白银/天然气）、比特币、黄金 vs TIPS 实际利率、外汇 Z-Score |
 | 🔬 万能画布 | 任意指标多选叠加，支持 Z-Score / Min-Max / 原始值三种归一化模式，附历史分位统计摘要 |
@@ -89,7 +101,7 @@ streamlit run app.py
 FRED_API_KEY = "你的FRED_API_KEY"
 ```
 
-**云端部署**（Streamlit Community Cloud），在应用 Settings → Secrets 中填写：
+**云端部署**（魔搭创空间），在「环境变量」中填写（可选，代码已带默认值）：
 
 ```toml
 FRED_API_KEY = "你的FRED_API_KEY"
@@ -99,12 +111,21 @@ FRED_API_KEY = "你的FRED_API_KEY"
 
 ---
 
-## ☁️ 部署到 Streamlit Community Cloud
+## ☁️ 部署到魔搭创空间（ModelScope Studio）
 
-1. 将仓库推送到 GitHub；
-2. 打开 https://share.streamlit.io ，用 GitHub 账号登录；
-3. New app → 选择仓库与分支 `main`，主文件填 `app.py`；
-4. 如需 FRED 密钥，在 Advanced settings → Secrets 填入 `FRED_API_KEY`（代码中已带默认值，不填也能运行）。
+国内可直连、免费、无需 GitHub。代码托管在 Gitee，运行在魔搭创空间。
+
+- 仓库根目录的 `ms_deploy.json` 声明了 `sdk_type: streamlit`、`base_image` 与 `resource_configuration`；
+- `README.md` 顶部 YAML 声明了 `sdk: streamlit`、`app_file: app.py`；
+- `.streamlit/config.toml` 已把服务端口固定为 `0.0.0.0:7860`（平台要求的端口）。
+
+**部署方式**：
+
+1. 登录 https://modelscope.cn ，进入「创空间」→「创建创空间」；
+2. 选择 **Streamlit** 类型或「快速部署」模式，上传本项目；
+3. 等待构建完成，即可获得形如 `https://modelscope.cn/studios/<用户名>/<空间名>` 的公网地址。
+
+> FRED Key 可通过创空间「环境变量」`FRED_API_KEY` 配置，代码中已带默认值，不配也能跑。
 
 ---
 
